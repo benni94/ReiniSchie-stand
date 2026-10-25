@@ -1,49 +1,100 @@
 # Scorecard OCR API
 
-FastAPI-Service zur automatischen Auswertung von Schützenvereins-Scorecards (PP1, NPA, etc.) mittels OpenAI GPT-4o Vision.
+FastAPI-Service zur automatischen Auswertung von Schützenvereins-Scorecards (PP1, NPA, etc.) mittels **lokalem** Ollama-Vision-Modell. Keine externe API nötig, keine Kosten pro Anfrage.
+
+## Voraussetzungen
+
+1. **Ollama installieren**
+   Lade Ollama für Windows/Mac/Linux herunter: https://ollama.com/download
+
+2. **Vision-Modell herunterladen**
+   Öffne ein Terminal und ziehe ein Modell:
+
+   ```bash
+   # Empfohlen (guter Kompromiss aus Qualität und Geschwindigkeit)
+   ollama pull llava
+
+   # Alternative: neueres Modell mit besserer Erkennung, aber höherer Hardware-Anforderung
+   ollama pull llama3.2-vision
+
+   # Alternative: sehr schnell und klein, aber weniger genau
+   ollama pull moondream
+   ```
+
+3. **Ollama starten**
+
+   ```bash
+   # WICHTIG: ollama serve nimmt KEIN Modell-Argument!
+   ollama serve
+   ```
+
+   Lass dieses Terminal offen. Das Modell wird beim ersten API-Call automatisch geladen.
 
 ## Schnellstart
 
 1. **Abhängigkeiten installieren**
+
    ```bash
    pip install -r requirements.txt
    ```
 
-2. **API-Key setzen**
-   ```bash
-   # Windows PowerShell
-   $env:OPENAI_API_KEY = "sk-..."
+2. **Server starten**
 
-   # Windows CMD
-   set OPENAI_API_KEY=sk-...
-   ```
-   Optional: Lege eine `.env`-Datei an oder nutze das Hosting-System deiner Wahl.
+   Führe im Projektordner aus (Git Bash / PowerShell / CMD):
 
-3. **Server starten**
    ```bash
-   uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+   python -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload
    ```
 
-4. **Testen**
-   Öffne die automatisch generierte API-Doku: [http://localhost:8000/docs](http://localhost:8000/docs)
+   Falls `python` nicht gefunden wird, probiere `py` statt `python`.
+
+3. **Testen**
+   - API-Doku: http://localhost:8000/docs
+   - Health-Check (zeigt Ollama-Status & Modell): http://localhost:8000/health
+
+## Anderes Modell nutzen
+
+Der Standard in `main.py` ist `llava`. Falls du ein anderes Modell verwenden möchtest, setze vor dem Server-Start die Umgebungsvariable:
+
+**Windows PowerShell:**
+
+```powershell
+$env:OLLAMA_MODEL = "moondream"
+python -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+**Windows CMD:**
+
+```cmd
+set OLLAMA_MODEL=moondream
+python -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+**Linux/macOS (Bash):**
+
+```bash
+export OLLAMA_MODEL=moondream
+python -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+```
 
 ## Endpunkte
 
 - `POST /process-scorecard` — Liefert ein strukturiertes JSON aus dem hochgeladenen Scorecard-Bild.
-- `GET /health` — Health-Check.
+- `GET /health` — Prüft Erreichbarkeit von Ollama und zeigt konfiguriertes Modell an.
 
 ## n8n-Workflow (HTTP Request Node)
 
 1. **HTTP Request Node** anlegen.
 2. **Method**: `POST`
 3. **URL**: `http://<dein-server>:8000/process-scorecard`
-4. **Authentication**: Keine (oder Basic-Auth/Header falls du sie hinzufügst).
+4. **Authentication**: Keine.
 5. **Body**: `Form-Data`
    - **Key**: `file` (Typ: `File`)
    - **Value**: Das Bild (JPEG/PNG).
 6. **Response** ist das JSON-Objekt, das du direkt in weiteren Nodes weiterverarbeiten kannst.
 
 Beispiel-Response:
+
 ```json
 {
   "schuetze": "Geuze Michael SG Lustenau",
@@ -63,13 +114,13 @@ Beispiel-Response:
     "ringe_gesamt": "300"
   },
   "auswerter": null,
-  "modell": "gpt-4o"
+  "modell": "llava"
 }
 ```
 
 ## Konfiguration via Umgebungsvariablen
 
-| Variable | Standard | Beschreibung |
-|----------|----------|--------------|
-| `OPENAI_API_KEY` | — | **Pflicht.** Dein OpenAI API-Key. |
-| `OPENAI_MODEL` | `gpt-4o` | Alternativ `gpt-4o-mini` für niedrigere Kosten. |
+| Variable       | Standard                 | Beschreibung                     |
+| -------------- | ------------------------ | -------------------------------- |
+| `OLLAMA_HOST`  | `http://localhost:11434` | URL der Ollama-Instanz.          |
+| `OLLAMA_MODEL` | `llava`                  | Name des lokalen Vision-Modells. |

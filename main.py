@@ -1,6 +1,6 @@
 """
 FastAPI Service zur Auswertung von Schützenvereins-Scorecards (PP1, NPA etc.)
-mit OpenAI GPT-4o Vision API.
+mit einem lokalen Vision-Modell via Ollama.
 """
 
 import base64
@@ -9,30 +9,23 @@ import os
 from io import BytesIO
 from typing import List, Optional
 
+import httpx
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from openai import OpenAI
 from PIL import Image
 from pydantic import BaseModel, Field
 
 # ---------------------------------------------------------------------------
 # Konfiguration
 # ---------------------------------------------------------------------------
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    raise RuntimeError(
-        "Umgebungsvariable 'OPENAI_API_KEY' ist nicht gesetzt. "
-        "Bitte setze sie vor dem Start des Servers."
-    )
+OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llava")
+MAX_IMAGE_SIZE = (1024, 1024)  # Lokale Modelle sind langsamer -> kleineres Bild
 
-MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o")
-MAX_IMAGE_SIZE = (2048, 2048)  # GPT-4o Vision Limit ist hoch, aber wir skalieren runter
-
-client = OpenAI(api_key=OPENAI_API_KEY)
 app = FastAPI(
     title="Scorecard OCR API",
-    description="Liest Schützenvereins-Auswertekarten per GPT-4o Vision aus.",
-    version="1.0.0",
+    description="Liest Schützenvereins-Auswertekarten per lokalem Ollama-Vision-Modell aus.",
+    version="2.0.0",
 )
 
 app.add_middleware(
@@ -73,79 +66,59 @@ class ScorecardAuswertung(BaseModel):
     datum_zeit: Optional[str] = Field(None, description="Datum und Uhrzeit, z.B. '21.09.2026 18:00 - 21:00'")
     ergebnisse: Ergebnisse = Field(default_factory=Ergebnisse)
     auswerter: Optional[str] = Field(None, description="Name/Unterschrift des Auswerters")
-    modell: str = Field(MODEL, description="Verwendetes AI-Modell")
+    modell: str = Field(OLLAMA_MODEL, description="Verwendetes AI-Modell")
 
 
 # ---------------------------------------------------------------------------
-# System-Prompt (detailliert, damit GPT-4o die Struktur versteht)
+# Prompt (kurz und praezise fuer lokale kleine Modelle)
 # ---------------------------------------------------------------------------
-SYSTEM_PROMPT = """Du bist ein OCR-Experte für Schützenvereins-Auswertekarten (Scorecards).
-Analysiere das hochgeladene Bild sorgfältig und extrahiere alle handschriftlichen und gedruckten Informationen.
+SYSTEM_PROMPT = """Lies die Schuetzenvereins-Scorecard aus dem Bild aus.
 
-## Karten-Struktur
+Extrahiere:
+- schuetze: Name aus "Schuetze / shooter"
+- disziplin: z.B. PP1(AUT) oder NPA(AUT)
+- disziplin_checkbox: angekreuzte Disziplin, z.B. PP1 oder NPA
+- stand_details: z.B. P2 25m Stand xy
+- datum_zeit: z.B. 21.09.2026 18:00 - 21:00
+- auswerter: Name des Auswerters (unten auf der Karte), NICHT der Schuetze
 
-Oben rechts befindet sich eine Box mit:
-- "Schütze / shooter:" gefolgt vom Namen und Verein (z.B. "Geuze Michael SG Lustenau")
-- Disziplin: z.B. "PP1(AUT)" oder "NPA(AUT)"
-- Stand-Details: z.B. "P2 25m Stand xy"
-- Datum/Zeit: z.B. "21.09.2026 18:00 - 21:00"
+Ergebnisse Tabelle:
+Lies fuer JEDE Zeile die handschriftlichen Zahlen aus!
+PP1-Kategorien: X, 10, 9, 8, 7, 6, 5, 0, miss
+NPA-Kategorien: X, 5, 4, 3, 2, 0, miss
+Pro Kategorie ein JSON-Objekt in "zeilen".
 
-Darunter befinden sich Checkboxen für verschiedene Disziplinen:
-- PP1-Karte: PP1, PP1 Optic, PP1 Rifle, PP1-Uhr, PP3, PP4, SM, SM-O
-- NPA-Karte: NPA, NPA Open, NPA Rifle.22, NPA Rifle .223, NPA Rifle PCC, Uhr
-Es ist immer genau eine Checkbox mit einem Kreuz (X) markiert.
+Wichtig:
+- Nur valides JSON zurueckgeben. Keine Erklaerungstexte.
+- Alle Strings in DOPPELTEN Anfuehrungszeichen.
+- Leere oder nicht erkennbare Felder = null.
+- Trage die tatsaechlich gelesenen Zahlen ein, keine Platzhalter.
 
-## Ergebnis-Tabelle
-
-Die Tabelle hat folgende Spalten (von links nach rechts):
-1. PP1: "station 1" (handschriftliche Treffer pro Ring-Kategorie)
-2. PP1: "station 2 + 3" (handschriftliche Treffer pro Ring-Kategorie)
-3. Ringe-Kategorien: X, 10, 9, 8, 7, 6, 5, 0, miss, total (gedruckte Labels)
-4. "Treffer / hits" (oft leer, manchmal handschriftlich)
-5. "Ringe / score" (oft leer, manchmal handschriftlich)
-
-Bei NPA-Karten heißen die ersten beiden Spalten:
-1. "linke Scheibe"
-2. "rechte Scheibe"
-Und die Ringe-Kategorien sind: X, 5, 4, 3, 2, 0, miss, total
-
-Ganz unten in der Tabelle stehen die Summen:
-- PP1: z.B. "12(10)" für Station 1, "18(20)" für Station 2+3, Gesamttreffer "30", Gesamt-Ringe "300"
-- NPA: z.B. "12" für linke Scheibe, "12" für rechte Scheibe, Gesamttreffer "24", Gesamt-Ringe "120"
-
-Unten auf der Karte steht nochmals "Schütze / shooter:" mit einer Unterschrift. Wenn du den Namen der unterschreibenden Person erkennen kannst, trage ihn als "auswerter" ein.
-
-## Wichtige Hinweise
-- Lies handschriftliche Zahlen so genau wie möglich. Wenn du unsicher bist, gib den wahrscheinlichsten Wert an.
-- Wenn ein Feld leer ist, verwende null.
-- Bei Streichungen oder Korrekturen (z.B. durchgestrichene Zahl + neue Zahl) nimm die korrigierte/gültige Zahl.
-- Das Feld "auswerter" ist der Name des Auswerters (falls lesbar), NICHT der Schütze.
-- Gib das Ergebnis AUSSCHLIESSLICH als JSON im folgenden Schema zurück. Keine Erklärungstexte, nur JSON.
-
-## JSON-Schema
-
+Beispiel fuer eine PP1-Karte:
 {
-  "schuetze": "string oder null",
-  "disziplin": "string oder null (z.B. 'PP1(AUT)')",
-  "disziplin_checkbox": "string oder null (z.B. 'PP1' oder 'NPA')",
-  "stand_details": "string oder null",
-  "datum_zeit": "string oder null",
+  "schuetze": "Geuze Michael SG Lustenau",
+  "disziplin": "PP1(AUT)",
+  "disziplin_checkbox": "PP1",
+  "stand_details": "P2 25m Stand xy",
+  "datum_zeit": "21.09.2026 18:00 - 21:00",
   "ergebnisse": {
     "zeilen": [
-      {
-        "kategorie": "string (z.B. 'X', '10', '9', '8', '7', '6', '5', '0', 'miss')",
-        "station_1_links": "string oder null",
-        "station_2_rechts": "string oder null",
-        "treffer": "string oder null",
-        "ringe": "string oder null"
-      }
+      {"kategorie": "X", "station_1_links": "2", "station_2_rechts": null, "treffer": null, "ringe": null},
+      {"kategorie": "10", "station_1_links": "13", "station_2_rechts": null, "treffer": null, "ringe": null},
+      {"kategorie": "9", "station_1_links": "12", "station_2_rechts": null, "treffer": null, "ringe": null},
+      {"kategorie": "8", "station_1_links": "2", "station_2_rechts": null, "treffer": null, "ringe": null},
+      {"kategorie": "7", "station_1_links": "1", "station_2_rechts": null, "treffer": null, "ringe": null},
+      {"kategorie": "6", "station_1_links": null, "station_2_rechts": null, "treffer": null, "ringe": null},
+      {"kategorie": "5", "station_1_links": null, "station_2_rechts": null, "treffer": null, "ringe": null},
+      {"kategorie": "0", "station_1_links": null, "station_2_rechts": null, "treffer": null, "ringe": null},
+      {"kategorie": "miss", "station_1_links": null, "station_2_rechts": null, "treffer": null, "ringe": null}
     ],
-    "station_1_total": "string oder null",
-    "station_2_total": "string oder null",
-    "treffer_gesamt": "string oder null",
-    "ringe_gesamt": "string oder null"
+    "station_1_total": "12(10)",
+    "station_2_total": "18(20)",
+    "treffer_gesamt": "30",
+    "ringe_gesamt": "300"
   },
-  "auswerter": "string oder null"
+  "auswerter": null
 }
 """
 
@@ -155,26 +128,94 @@ Unten auf der Karte steht nochmals "Schütze / shooter:" mit einer Unterschrift.
 
 def resize_and_encode_image(image: Image.Image) -> str:
     """
-    Skaliert das Bild herunter (damit es schneller verarbeitet wird) und
-    encodiert es als Base64-Data-URL.
+    Skaliert das Bild herunter (lokale Modelle sind langsamer, daher kleiner)
+    und liefert einen reinen Base64-String (ohne Data-URL-Prefix),
+    wie Ollama es erwartet.
     """
-    # GPT-4o kann bis zu 2048x2048 gut verarbeiten, wir behalten Seitenverhältnis bei
     image.thumbnail(MAX_IMAGE_SIZE, Image.Resampling.LANCZOS)
-    # Konvertiere zu RGB falls nötig (JPEG unterstützt kein RGBA)
     if image.mode in ("RGBA", "P"):
         image = image.convert("RGB")
     buffer = BytesIO()
     image.save(buffer, format="JPEG", quality=85)
-    encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
-    return f"data:image/jpeg;base64,{encoded}"
+    return base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+def extract_json(raw: str) -> str:
+    """
+    Extrahiert das JSON-Objekt aus einer Text-Antwort, die evtl. Erklärungstext
+    oder Markdown-Codeblöcke drumherum hat. Liefert den ersten Inhalt zwischen
+    den aeußersten geschweiften Klammern {} zurück.
+    """
+    raw = raw.strip()
+    # Entferne evtl. Markdown-Codeblock
+    if raw.startswith("```json"):
+        raw = raw[7:]
+    if raw.startswith("```"):
+        raw = raw[3:]
+    if raw.endswith("```"):
+        raw = raw[:-3]
+    raw = raw.strip()
+
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return raw[start:end + 1]
+    return raw
+
+
+import re
+
+
+def repair_json(text: str) -> str:
+    """
+    Repariert typische JSON-Fehler, die kleine lokale LLMs produzieren:
+    - einfache Anfuehrungszeichen -> doppelte
+    - Python True/False -> true/false
+    - Python None -> null
+    - Trailing commas
+    - Unquoted keys (best-effort)
+    """
+    # 1. Einfache Anfuehrungszeichen bei Strings ersetzen (nur aeussere, nicht innere)
+    # Das ist heikel – wir versuchen es nur fuer offensichtliche Faelle
+    text = re.sub(r"'([^']*)'(?=\s*[:,}\]])", r'"\1"', text)
+
+    # 2. True/False/None -> true/false/null
+    text = re.sub(r'\bTrue\b', 'true', text)
+    text = re.sub(r'\bFalse\b', 'false', text)
+    text = re.sub(r'\bNone\b', 'null', text)
+
+    # 3. Trailing commas vor } oder ]
+    text = re.sub(r',(\s*[}\]])', r'\1', text)
+
+    # 4. Unquoted keys (best-effort): key: -> "key":
+    text = re.sub(r'([{,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)\s*:', r'\1"\2":', text)
+
+    return text
 
 
 def parse_vision_response(raw_json: str) -> ScorecardAuswertung:
     """Parst die JSON-Antwort des Vision-Modells in das Pydantic-Modell."""
+    cleaned = extract_json(raw_json)
+    logger.info("Cleaned JSON length: %s", len(cleaned))
+
+    # Versuche zuerst direkt zu parsen
     try:
-        data = json.loads(raw_json)
-    except json.JSONDecodeError as exc:
-        raise HTTPException(status_code=500, detail=f"Ungültiges JSON vom Vision-Modell: {exc}")
+        data = json.loads(cleaned)
+    except json.JSONDecodeError:
+        # Versuche Reparatur
+        logger.warning("Direct JSON parsing failed, attempting repair...")
+        repaired = repair_json(cleaned)
+        try:
+            data = json.loads(repaired)
+            logger.info("JSON repair successful")
+        except json.JSONDecodeError as exc:
+            logger.error("Failed to parse JSON. Raw content (first 2000 chars): %s", raw_json[:2000])
+            raise HTTPException(status_code=500, detail=f"Ungueltiges JSON vom Vision-Modell: {exc}")
 
     # Stelle sicher, dass ergebnisse ein dict ist
     ergebnisse_raw = data.get("ergebnisse") or {}
@@ -198,7 +239,7 @@ def parse_vision_response(raw_json: str) -> ScorecardAuswertung:
         datum_zeit=data.get("datum_zeit"),
         ergebnisse=ergebnisse,
         auswerter=data.get("auswerter"),
-        modell=MODEL,
+        modell=OLLAMA_MODEL,
     )
 
 
@@ -210,14 +251,14 @@ def parse_vision_response(raw_json: str) -> ScorecardAuswertung:
     "/process-scorecard",
     response_model=ScorecardAuswertung,
     summary="Scorecard-Bild analysieren",
-    description="Liest eine Schützenvereins-Auswertekarte per GPT-4o Vision API aus.",
+    description="Liest eine Schuetzenvereins-Auswertekarte per lokalem Ollama-Vision-Modell aus.",
 )
 async def process_scorecard(file: UploadFile = File(...)) -> ScorecardAuswertung:
     # --- Validierung ---
     if file.content_type not in ("image/jpeg", "image/png", "image/jpg", "image/webp"):
         raise HTTPException(
             status_code=400,
-            detail=f"Ungültiger Dateityp: {file.content_type}. Nur JPEG/PNG/WebP erlaubt.",
+            detail=f"Ungueltiger Dateityp: {file.content_type}. Nur JPEG/PNG/WebP erlaubt.",
         )
 
     # --- Bild laden ---
@@ -227,39 +268,79 @@ async def process_scorecard(file: UploadFile = File(...)) -> ScorecardAuswertung
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Bild konnte nicht geladen werden: {exc}")
 
-    # --- Base64-Encoding ---
-    data_url = resize_and_encode_image(image)
+    # --- Base64-Encoding (nur raw base64 fuer Ollama) ---
+    image_b64 = resize_and_encode_image(image)
 
-    # --- GPT-4o Vision API ---
-    try:
-        response = client.chat.completions.create(
-            model=MODEL,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": "Lies diese Scorecard aus und gib das Ergebnis als JSON zurück.",
-                        },
-                        {"type": "image_url", "image_url": {"url": data_url, "detail": "high"}},
-                    ],
-                },
-            ],
-            response_format={"type": "json_object"},
-            max_tokens=2048,
+    # --- Ollama API (/api/chat) ---
+    payload = {
+        "model": OLLAMA_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": SYSTEM_PROMPT,
+            },
+            {
+                "role": "user",
+                "content": "Lies diese Scorecard aus und gib das Ergebnis als JSON zurueck.",
+                "images": [image_b64],
+            },
+        ],
+        "stream": False,
+        "format": "json",
+        "options": {
+            "temperature": 0.1,   # moeglichst deterministisch
+            "num_predict": 2048,  # Max. Tokens
+        },
+    }
+
+    url = f"{OLLAMA_HOST.rstrip('/')}/api/chat"
+
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        try:
+            resp = await client.post(url, json=payload)
+        except httpx.ConnectError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Verbindung zu Ollama fehlgeschlagen ({OLLAMA_HOST}). Ist Ollama gestartet? Details: {exc}",
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Fehler bei Ollama-Anfrage: {exc}")
+
+    if resp.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Ollama antwortete mit Status {resp.status_code}: {resp.text}",
         )
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Fehler bei OpenAI API: {exc}")
 
-    raw_json = response.choices[0].message.content or "{}"
+    try:
+        ollama_data = resp.json()
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=502, detail=f"Ungueltige JSON-Antwort von Ollama: {exc}")
+
+    raw_json = ollama_data.get("message", {}).get("content", "{}")
+    if not raw_json:
+        raw_json = "{}"
+
     return parse_vision_response(raw_json)
 
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "modell": MODEL}
+    # Pruefe ob Ollama erreichbar ist
+    url = f"{OLLAMA_HOST.rstrip('/')}/api/tags"
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(url)
+        ollama_ok = resp.status_code == 200
+    except Exception:
+        ollama_ok = False
+
+    return {
+        "status": "ok" if ollama_ok else "degraded",
+        "ollama_erreichbar": ollama_ok,
+        "modell": OLLAMA_MODEL,
+        "ollama_host": OLLAMA_HOST,
+    }
 
 
 # ---------------------------------------------------------------------------
