@@ -12,15 +12,22 @@ from typing import List, Optional
 import httpx
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from PIL import Image
-from pydantic import BaseModel, Field
+from PIL import Image, ImageEnhance, ImageFilter
+from pydantic import BaseModel, Field, field_validator
+
+# Optional: EasyOCR fuer handschriftliche Zahlen
+try:
+    import easyocr
+    EASYOCR_AVAILABLE = True
+except ImportError:
+    EASYOCR_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # Konfiguration
 # ---------------------------------------------------------------------------
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llava")
-MAX_IMAGE_SIZE = (1024, 1024)  # Lokale Modelle sind langsamer -> kleineres Bild
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.2-vision")
+MAX_IMAGE_SIZE = (1536, 1536)  # Größer für bessere handschriftliche Erkennung
 
 app = FastAPI(
     title="Scorecard OCR API",
@@ -57,6 +64,15 @@ class Ergebnisse(BaseModel):
     ringe_gesamt: Optional[str] = Field(None, description="Gesamt-Ringe/Score")
 
 
+def _coerce_str(v):
+    """Hilfsfunktion: Wandelt Listen/Dicts in None um, ansonsten String."""
+    if v is None:
+        return None
+    if isinstance(v, str):
+        return v
+    return None
+
+
 class ScorecardAuswertung(BaseModel):
     """Vollständiges Auswertungsergebnis einer Scorecard."""
     schuetze: Optional[str] = Field(None, description="Name des Schützen aus Feld 'Schütze / shooter'")
@@ -68,75 +84,172 @@ class ScorecardAuswertung(BaseModel):
     auswerter: Optional[str] = Field(None, description="Name/Unterschrift des Auswerters")
     modell: str = Field(OLLAMA_MODEL, description="Verwendetes AI-Modell")
 
+    @field_validator("schuetze", "disziplin", "disziplin_checkbox", "stand_details", "datum_zeit", "auswerter", mode="before")
+    @classmethod
+    def _fix_str_fields(cls, v):
+        return _coerce_str(v)
+
 
 # ---------------------------------------------------------------------------
-# Prompt (kurz und praezise fuer lokale kleine Modelle)
+# Prompt fuer llama3.2-vision
 # ---------------------------------------------------------------------------
-SYSTEM_PROMPT = """Lies die Schuetzenvereins-Scorecard aus dem Bild aus.
+PROMPT_KOPF = """Du siehst den oberen Teil einer Schuetzenvereins-Scorecard.
+Lies die Textfelder und gib NUR JSON zurueck.
 
-Extrahiere:
-- schuetze: Name aus "Schuetze / shooter"
-- disziplin: z.B. PP1(AUT) oder NPA(AUT)
-- disziplin_checkbox: angekreuzte Disziplin, z.B. PP1 oder NPA
-- stand_details: z.B. P2 25m Stand xy
-- datum_zeit: z.B. 21.09.2026 18:00 - 21:00
-- auswerter: Name des Auswerters (unten auf der Karte), NICHT der Schuetze
+Felder:
+- schuetze: Name unter "Schuetze / shooter"
+- disziplin: z.B. "PP1(AUT)"
+- disziplin_checkbox: angekreuzte Disziplin, z.B. "PP1"
+- stand_details: z.B. "P2 25m Stand xy"
+- datum_zeit: z.B. "21.09.2026 18:00 - 21:00"
 
-Ergebnisse Tabelle:
-Lies fuer JEDE Zeile die handschriftlichen Zahlen aus!
-PP1-Kategorien: X, 10, 9, 8, 7, 6, 5, 0, miss
-NPA-Kategorien: X, 5, 4, 3, 2, 0, miss
-Pro Kategorie ein JSON-Objekt in "zeilen".
+Regeln: NUR JSON. Leer = null.
+Schema: {"schuetze":null,"disziplin":null,"disziplin_checkbox":null,"stand_details":null,"datum_zeit":null}
+"""
 
-Wichtig:
-- Nur valides JSON zurueckgeben. Keine Erklaerungstexte.
-- Alle Strings in DOPPELTEN Anfuehrungszeichen.
-- Leere oder nicht erkennbare Felder = null.
-- Trage die tatsaechlich gelesenen Zahlen ein, keine Platzhalter.
+PROMPT_TABELLE = """Du siehst eine vergroesserte Tabelle aus einer Schuetzenvereins-Scorecard.
+Lies die handschriftlichen Zahlen und gib NUR JSON zurueck.
 
-Beispiel fuer eine PP1-Karte:
-{
-  "schuetze": "Geuze Michael SG Lustenau",
-  "disziplin": "PP1(AUT)",
-  "disziplin_checkbox": "PP1",
-  "stand_details": "P2 25m Stand xy",
-  "datum_zeit": "21.09.2026 18:00 - 21:00",
-  "ergebnisse": {
-    "zeilen": [
-      {"kategorie": "X", "station_1_links": "2", "station_2_rechts": null, "treffer": null, "ringe": null},
-      {"kategorie": "10", "station_1_links": "13", "station_2_rechts": null, "treffer": null, "ringe": null},
-      {"kategorie": "9", "station_1_links": "12", "station_2_rechts": null, "treffer": null, "ringe": null},
-      {"kategorie": "8", "station_1_links": "2", "station_2_rechts": null, "treffer": null, "ringe": null},
-      {"kategorie": "7", "station_1_links": "1", "station_2_rechts": null, "treffer": null, "ringe": null},
-      {"kategorie": "6", "station_1_links": null, "station_2_rechts": null, "treffer": null, "ringe": null},
-      {"kategorie": "5", "station_1_links": null, "station_2_rechts": null, "treffer": null, "ringe": null},
-      {"kategorie": "0", "station_1_links": null, "station_2_rechts": null, "treffer": null, "ringe": null},
-      {"kategorie": "miss", "station_1_links": null, "station_2_rechts": null, "treffer": null, "ringe": null}
-    ],
-    "station_1_total": "12(10)",
-    "station_2_total": "18(20)",
-    "treffer_gesamt": "30",
-    "ringe_gesamt": "300"
-  },
-  "auswerter": null
-}
+DIE TABELLE:
+- Links stehen die Kategorien: X, 10, 9, 8, 7, 6, 5, 0, miss (von oben nach unten)
+- Daneben sind Spalten mit handschriftlichen Zahlen
+- Du musst fuer JEDE Kategorie die Zahl in der ERSTEN Spalte (links) lesen
+
+WICHTIG: Gib die Zeilen IN DER RICHTIGEN REIHENFOLGE zurueck.
+Reihenfolge von oben nach unten: X, 10, 9, 8, 7, 6, 5, 0, miss
+
+ZUSÄTZLICH unten in der Tabelle:
+- total_zeile_station_1: Die Zahl in der "total" Zeile, erste Spalte (z.B. "30")
+- station_1_total: z.B. "12(10)"
+- station_2_total: z.B. "18(20)"
+- treffer_gesamt: z.B. "30"
+- ringe_gesamt: z.B. "300"
+
+Regeln:
+- NUR JSON, keine Erklaerungen.
+- DOPPELTE Anfuehrungszeichen.
+- Leer oder nicht erkennbar = null.
+- Schreibe die Zahlen EXAKT so wie sie im Bild stehen.
+
+Schema:
+{"zeilen":[{"kategorie":"X","station_1_links":null,"station_2_rechts":null},{"kategorie":"10","station_1_links":null,"station_2_rechts":null},{"kategorie":"9","station_1_links":null,"station_2_rechts":null},{"kategorie":"8","station_1_links":null,"station_2_rechts":null},{"kategorie":"7","station_1_links":null,"station_2_rechts":null},{"kategorie":"6","station_1_links":null,"station_2_rechts":null},{"kategorie":"5","station_1_links":null,"station_2_rechts":null},{"kategorie":"0","station_1_links":null,"station_2_rechts":null},{"kategorie":"miss","station_1_links":null,"station_2_rechts":null}],"total_zeile_station_1":null,"station_1_total":null,"station_2_total":null,"treffer_gesamt":null,"ringe_gesamt":null}
 """
 
 # ---------------------------------------------------------------------------
 # Hilfsfunktionen
 # ---------------------------------------------------------------------------
 
-def resize_and_encode_image(image: Image.Image) -> str:
-    """
-    Skaliert das Bild herunter (lokale Modelle sind langsamer, daher kleiner)
-    und liefert einen reinen Base64-String (ohne Data-URL-Prefix),
-    wie Ollama es erwartet.
-    """
+def preprocess_image(image: Image.Image) -> Image.Image:
+    """Skaliert und schaerft das Bild fuer bessere OCR."""
     image.thumbnail(MAX_IMAGE_SIZE, Image.Resampling.LANCZOS)
     if image.mode in ("RGBA", "P"):
         image = image.convert("RGB")
+    # Mehr Schaerfe fuer handschriftliche Zahlen
+    enhancer = ImageEnhance.Sharpness(image)
+    image = enhancer.enhance(2.0)
+    # Weniger Kontrast als vorher, damit blaue Tinte nicht verschwindet
+    enhancer = ImageEnhance.Contrast(image)
+    image = enhancer.enhance(1.2)
+    # Helligkeit leicht erhoehen
+    enhancer = ImageEnhance.Brightness(image)
+    image = enhancer.enhance(1.1)
+    return image
+
+
+def split_for_regions(image: Image.Image) -> tuple[Image.Image, Image.Image]:
+    """Teilt das Bild in Kopf (Text) und Tabelle (Zahlen)."""
+    w, h = image.size
+    # Kopf: obere 45%
+    kopf = image.crop((0, 0, w, int(h * 0.45)))
+    # Tabelle: untere 55%, skaliert auf volle Hoehe fuer bessere Erkennung
+    tabelle = image.crop((0, int(h * 0.35), w, h))
+    # Tabelle auf volle Groesse skalieren
+    tabelle = tabelle.resize((w, h), Image.Resampling.LANCZOS)
+    return kopf, tabelle
+
+
+def extract_table_with_easyocr(image: Image.Image) -> dict:
+    """Liest die Tabelle mit EasyOCR aus (Zeilen-basiert)."""
+    if not EASYOCR_AVAILABLE:
+        return {}
+
+    import numpy as np
+
+    # Lazy-Initialisierung
+    if not hasattr(extract_table_with_easyocr, "_reader"):
+        extract_table_with_easyocr._reader = easyocr.Reader(["en", "de"], gpu=False)
+
+    reader = extract_table_with_easyocr._reader
+    w, h = image.size
+
+    # Tabelle in 9 Zeilen aufteilen (X, 10, 9, 8, 7, 6, 5, 0, miss)
+    kategorien = ["X", "10", "9", "8", "7", "6", "5", "0", "miss"]
+    zeilen_hoehe = h // 9
+    zeilen = []
+
+    for i, kat in enumerate(kategorien):
+        y1 = i * zeilen_hoehe
+        y2 = (i + 1) * zeilen_hoehe if i < 8 else h
+        row_img = image.crop((0, y1, w, y2))
+
+        # OCR auf der Zeile ausfuehren
+        results = reader.readtext(np.array(row_img))
+
+        # Nur Zahlen extrahieren (hoechste Konfidenz zuerst)
+        zahlen = []
+        for (_, text, conf) in results:
+            text = text.strip()
+            if text.isdigit():
+                zahlen.append((text, conf))
+
+        # Sortieren nach Konfidenz und ersten 2 nehmen
+        zahlen.sort(key=lambda x: x[1], reverse=True)
+        station_1 = zahlen[0][0] if zahlen else None
+
+        zeilen.append({
+            "kategorie": kat,
+            "station_1_links": station_1,
+            "station_2_rechts": None,
+        })
+
+    # Summenzeile (letzter Streifen)
+    summen_img = image.crop((0, h - zeilen_hoehe, w, h))
+    summen_results = reader.readtext(np.array(summen_img))
+    summen_zahlen = [text for (_, text, _) in summen_results if text.strip().isdigit() or "(" in text]
+
+    # Heuristik fuer Summen
+    station_1_total = None
+    station_2_total = None
+    treffer_gesamt = None
+    ringe_gesamt = None
+
+    for (_, text, _) in summen_results:
+        text = text.strip()
+        if "(" in text and ")" in text:
+            if station_1_total is None:
+                station_1_total = text
+            elif station_2_total is None:
+                station_2_total = text
+
+    # Reine Zahlen fuer Treffer und Ringe
+    pure_numbers = [text for (_, text, _) in summen_results if text.strip().isdigit()]
+    if len(pure_numbers) >= 2:
+        treffer_gesamt = pure_numbers[-2]
+        ringe_gesamt = pure_numbers[-1]
+
+    return {
+        "zeilen": zeilen,
+        "station_1_total": station_1_total,
+        "station_2_total": station_2_total,
+        "treffer_gesamt": treffer_gesamt,
+        "ringe_gesamt": ringe_gesamt,
+    }
+
+
+def encode_image(image: Image.Image) -> str:
+    """Bild als Base64-String fuer Ollama."""
     buffer = BytesIO()
-    image.save(buffer, format="JPEG", quality=85)
+    image.save(buffer, format="JPEG", quality=90)
     return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
 
@@ -198,49 +311,53 @@ def repair_json(text: str) -> str:
     return text
 
 
-def parse_vision_response(raw_json: str) -> ScorecardAuswertung:
-    """Parst die JSON-Antwort des Vision-Modells in das Pydantic-Modell."""
-    cleaned = extract_json(raw_json)
-    logger.info("Cleaned JSON length: %s", len(cleaned))
-
-    # Versuche zuerst direkt zu parsen
+def parse_json_safe(raw: str) -> dict:
+    """Parst JSON mit Reparaturversuch, liefert leeres Dict bei Fehler."""
+    cleaned = extract_json(raw)
     try:
-        data = json.loads(cleaned)
+        return json.loads(cleaned)
     except json.JSONDecodeError:
-        # Versuche Reparatur
-        logger.warning("Direct JSON parsing failed, attempting repair...")
         repaired = repair_json(cleaned)
         try:
-            data = json.loads(repaired)
-            logger.info("JSON repair successful")
-        except json.JSONDecodeError as exc:
-            logger.error("Failed to parse JSON. Raw content (first 2000 chars): %s", raw_json[:2000])
-            raise HTTPException(status_code=500, detail=f"Ungueltiges JSON vom Vision-Modell: {exc}")
+            return json.loads(repaired)
+        except json.JSONDecodeError:
+            logger.error("JSON parsing failed. Raw: %s", raw[:500])
+            return {}
 
-    # Stelle sicher, dass ergebnisse ein dict ist
-    ergebnisse_raw = data.get("ergebnisse") or {}
-    zeilen_raw = ergebnisse_raw.get("zeilen") or []
 
-    zeilen = [ErgebnisZeile(**z) for z in zeilen_raw]
+async def query_ollama(image_b64: str, prompt: str) -> dict:
+    """Fragt Ollama mit einem Bild ab."""
+    payload = {
+        "model": OLLAMA_MODEL,
+        "messages": [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": "Lies dieses Bild.", "images": [image_b64]},
+        ],
+        "stream": False,
+        "format": "json",
+        "options": {"temperature": 0.1, "num_predict": 2048},
+    }
+    url = f"{OLLAMA_HOST.rstrip('/')}/api/chat"
 
-    ergebnisse = Ergebnisse(
-        zeilen=zeilen,
-        station_1_total=ergebnisse_raw.get("station_1_total"),
-        station_2_total=ergebnisse_raw.get("station_2_total"),
-        treffer_gesamt=ergebnisse_raw.get("treffer_gesamt"),
-        ringe_gesamt=ergebnisse_raw.get("ringe_gesamt"),
-    )
+    async with httpx.AsyncClient(timeout=600.0) as client:
+        try:
+            resp = await client.post(url, json=payload)
+        except httpx.ConnectError as exc:
+            raise HTTPException(status_code=503, detail=f"Ollama nicht erreichbar: {exc}")
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Ollama-Fehler: {type(exc).__name__}: {exc}")
 
-    return ScorecardAuswertung(
-        schuetze=data.get("schuetze"),
-        disziplin=data.get("disziplin"),
-        disziplin_checkbox=data.get("disziplin_checkbox"),
-        stand_details=data.get("stand_details"),
-        datum_zeit=data.get("datum_zeit"),
-        ergebnisse=ergebnisse,
-        auswerter=data.get("auswerter"),
-        modell=OLLAMA_MODEL,
-    )
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Ollama Status {resp.status_code}: {resp.text}")
+
+    try:
+        data = resp.json()
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=502, detail=f"Ungueltige Ollama-Antwort: {exc}")
+
+    raw = data.get("message", {}).get("content", "{}")
+    logger.info("Raw model response (first 500 chars): %s", raw[:500])
+    return parse_json_safe(raw)
 
 
 # ---------------------------------------------------------------------------
@@ -268,60 +385,41 @@ async def process_scorecard(file: UploadFile = File(...)) -> ScorecardAuswertung
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Bild konnte nicht geladen werden: {exc}")
 
-    # --- Base64-Encoding (nur raw base64 fuer Ollama) ---
-    image_b64 = resize_and_encode_image(image)
+    # --- Bild vorverarbeiten und aufteilen ---
+    processed = preprocess_image(image)
+    kopf_img, tabelle_img = split_for_regions(processed)
 
-    # --- Ollama API (/api/chat) ---
-    payload = {
-        "model": OLLAMA_MODEL,
-        "messages": [
-            {
-                "role": "system",
-                "content": SYSTEM_PROMPT,
-            },
-            {
-                "role": "user",
-                "content": "Lies diese Scorecard aus und gib das Ergebnis als JSON zurueck.",
-                "images": [image_b64],
-            },
-        ],
-        "stream": False,
-        "format": "json",
-        "options": {
-            "temperature": 0.1,   # moeglichst deterministisch
-            "num_predict": 2048,  # Max. Tokens
-        },
-    }
+    # --- Kopf mit llama3.2-vision ---
+    kopf_data = await query_ollama(encode_image(kopf_img), PROMPT_KOPF)
 
-    url = f"{OLLAMA_HOST.rstrip('/')}/api/chat"
+    # --- Tabelle mit EasyOCR (falls verfuegbar) oder llama3.2-vision ---
+    if EASYOCR_AVAILABLE:
+        tabelle_data = extract_table_with_easyocr(tabelle_img)
+    else:
+        tabelle_data = await query_ollama(encode_image(tabelle_img), PROMPT_TABELLE)
 
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        try:
-            resp = await client.post(url, json=payload)
-        except httpx.ConnectError as exc:
-            raise HTTPException(
-                status_code=503,
-                detail=f"Verbindung zu Ollama fehlgeschlagen ({OLLAMA_HOST}). Ist Ollama gestartet? Details: {exc}",
-            )
-        except Exception as exc:
-            raise HTTPException(status_code=502, detail=f"Fehler bei Ollama-Anfrage: {exc}")
+    # --- Ergebnisse parsen und zusammenfuehren ---
+    zeilen_raw = tabelle_data.get("zeilen") or []
+    zeilen = [ErgebnisZeile(**z) for z in zeilen_raw if isinstance(z, dict)]
 
-    if resp.status_code != 200:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Ollama antwortete mit Status {resp.status_code}: {resp.text}",
-        )
+    ergebnisse = Ergebnisse(
+        zeilen=zeilen,
+        station_1_total=tabelle_data.get("station_1_total"),
+        station_2_total=tabelle_data.get("station_2_total"),
+        treffer_gesamt=tabelle_data.get("treffer_gesamt"),
+        ringe_gesamt=tabelle_data.get("ringe_gesamt"),
+    )
 
-    try:
-        ollama_data = resp.json()
-    except json.JSONDecodeError as exc:
-        raise HTTPException(status_code=502, detail=f"Ungueltige JSON-Antwort von Ollama: {exc}")
-
-    raw_json = ollama_data.get("message", {}).get("content", "{}")
-    if not raw_json:
-        raw_json = "{}"
-
-    return parse_vision_response(raw_json)
+    return ScorecardAuswertung(
+        schuetze=kopf_data.get("schuetze"),
+        disziplin=kopf_data.get("disziplin"),
+        disziplin_checkbox=kopf_data.get("disziplin_checkbox"),
+        stand_details=kopf_data.get("stand_details"),
+        datum_zeit=kopf_data.get("datum_zeit"),
+        ergebnisse=ergebnisse,
+        auswerter=kopf_data.get("auswerter"),
+        modell=OLLAMA_MODEL,
+    )
 
 
 @app.get("/health")

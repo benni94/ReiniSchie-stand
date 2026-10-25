@@ -11,13 +11,13 @@ FastAPI-Service zur automatischen Auswertung von Schützenvereins-Scorecards (PP
    Öffne ein Terminal und ziehe ein Modell:
 
    ```bash
-   # Empfohlen (guter Kompromiss aus Qualität und Geschwindigkeit)
-   ollama pull llava
-
-   # Alternative: neueres Modell mit besserer Erkennung, aber höherer Hardware-Anforderung
+   # Empfohlen (beste Erkennung fuer handschriftliche Scorecards)
    ollama pull llama3.2-vision
 
-   # Alternative: sehr schnell und klein, aber weniger genau
+   # Alternative: schneller, aber weniger genau
+   ollama pull llava
+
+   # Alternative: sehr schnell und klein, aber ungenau
    ollama pull moondream
    ```
 
@@ -54,26 +54,26 @@ FastAPI-Service zur automatischen Auswertung von Schützenvereins-Scorecards (PP
 
 ## Anderes Modell nutzen
 
-Der Standard in `main.py` ist `llava`. Falls du ein anderes Modell verwenden möchtest, setze vor dem Server-Start die Umgebungsvariable:
+Der Standard in `main.py` ist `llama3.2-vision`. Falls du ein anderes Modell verwenden möchtest, setze vor dem Server-Start die Umgebungsvariable:
 
 **Windows PowerShell:**
 
 ```powershell
-$env:OLLAMA_MODEL = "moondream"
+$env:OLLAMA_MODEL = "llava"
 python -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
 **Windows CMD:**
 
 ```cmd
-set OLLAMA_MODEL=moondream
+set OLLAMA_MODEL=llava
 python -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
 **Linux/macOS (Bash):**
 
 ```bash
-export OLLAMA_MODEL=moondream
+export OLLAMA_MODEL=llava
 python -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
@@ -114,7 +114,7 @@ Beispiel-Response:
     "ringe_gesamt": "300"
   },
   "auswerter": null,
-  "modell": "llava"
+  "modell": "llama3.2-vision"
 }
 ```
 
@@ -123,4 +123,4 @@ Beispiel-Response:
 | Variable       | Standard                 | Beschreibung                     |
 | -------------- | ------------------------ | -------------------------------- |
 | `OLLAMA_HOST`  | `http://localhost:11434` | URL der Ollama-Instanz.          |
-| `OLLAMA_MODEL` | `llava`                  | Name des lokalen Vision-Modells. |
+| `OLLAMA_MODEL` | `llama3.2-vision`        | Name des lokalen Vision-Modells. |
