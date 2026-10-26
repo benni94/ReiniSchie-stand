@@ -224,16 +224,49 @@ def detect_table_structure(image: Image.Image) -> Optional[dict]:
         logger.warning("EasyOCR: weniger als 2 Kategorie-Labels erkannt")
         return None
 
-    cat_x = sorted(t["cx"] for t in cat_tokens)[len(cat_tokens) // 2]
+    mt_xs = [it["cx"] for it in items
+             if it["text"].lower() in ("miss", "total") and it["conf"] >= 0.5]
+    if mt_xs:
+        cat_x = sum(mt_xs) / len(mt_xs)
+    else:
+        cat_x = sorted(t["cx"] for t in cat_tokens)[len(cat_tokens) // 2]
+
     anchors = {}
     for it in cat_tokens:
-        if abs(it["cx"] - cat_x) <= 0.15 * w:
+        box_h = it["y1"] - it["y0"]
+        if (abs(it["cx"] - cat_x) <= 0.06 * w
+                and it["conf"] >= 0.35
+                and box_h <= 0.10 * h
+                and it["cy"] > 0.15 * h):
             idx = cat_lower.index(it["text"].lower())
             anchors.setdefault(idx, []).append(it["cy"])
     anchors = {idx: sum(v) / len(v) for idx, v in anchors.items()}
     if len(anchors) < 2:
         logger.warning("EasyOCR: zu wenige Zeilen-Anker")
         return None
+
+    # Robuster linearer Fit (filtert Ausreisser wie falsch gelesene Ziffern)
+    anchor_idxs = sorted(anchors.keys())
+    best_inliers = []
+    best_err = float("inf")
+    for i in range(len(anchor_idxs)):
+        for j in range(i + 1, len(anchor_idxs)):
+            idx1, idx2 = anchor_idxs[i], anchor_idxs[j]
+            b_cand = (anchors[idx2] - anchors[idx1]) / (idx2 - idx1)
+            if not (10.0 <= b_cand <= h * 0.25):
+                continue
+            a_cand = anchors[idx1] - b_cand * idx1
+            tol = max(6.0, 0.22 * b_cand)
+            inliers = [k for k in anchor_idxs
+                       if abs(anchors[k] - (a_cand + b_cand * k)) <= tol]
+            err = sum(abs(anchors[k] - (a_cand + b_cand * k)) for k in inliers) / len(inliers)
+            if (len(inliers) > len(best_inliers)
+                    or (len(inliers) == len(best_inliers) and err < best_err)):
+                best_inliers = inliers
+                best_err = err
+
+    if len(best_inliers) >= 2:
+        anchors = {k: anchors[k] for k in best_inliers}
 
     # Zeilen sind gleichmaessig verteilt -> linearer Fit: cy = a + b*idx
     idxs = np.array(list(anchors.keys()))
@@ -348,7 +381,7 @@ Antworte NUR als JSON:
 
 def _ink_ratio(gray, box, center=False) -> float:
     """Dunkler-Pixel-Anteil in einer Zelle.
-    center=True misst nur die Zellmitte (innerste 40%x50%) - dort schlaegt
+    center=True misst nur die Zellmitte (innerste 60%x50%) - dort schlaegt
     Ueberlauf-Tinte aus Nachbarzellen nicht zu, echte Handschrift schon.
     """
     x0, y0, x1, y1 = box
@@ -357,12 +390,41 @@ def _ink_ratio(gray, box, center=False) -> float:
     if ch < 5 or cw < 5:
         return 0.0
     if center:
-        inner = cell[int(ch * .25):int(ch * .75), int(cw * .30):int(cw * .70)]
+        inner = cell[int(ch * .25):int(ch * .75), int(cw * .20):int(cw * .80)]
+        if inner.size == 0:
+            return 0.0
+        dark = inner < 125
+        # Echte Ziffern erstrecken sich vertikal ueber mindestens 45% des
+        # Zellzentrums; horizontale Gitterlinien/Bleed treffen nur wenige Zeilen.
+        if (dark.sum(axis=1) > 0).mean() < 0.45:
+            return 0.0
+        return float(dark.mean() * 100)
     else:
         inner = cell[int(ch * .15):int(ch * .85), int(cw * .10):int(cw * .90)]
-    if inner.size == 0:
-        return 0.0
-    return float((inner < 110).mean() * 100)
+        if inner.size == 0:
+            return 0.0
+        return float((inner < 125).mean() * 100)
+
+
+def _is_slash_cell(gray, box) -> tuple[bool, float]:
+    """Erkennt duenne diagonale Durchstreich-Linien (/ oder \\) in leeren Zeilen."""
+    import numpy as np
+
+    x0, y0, x1, y1 = box
+    cell = gray[y0:y1, x0:x1]
+    ch, cw = cell.shape
+    if ch < 5 or cw < 5:
+        return False, 0.0
+    inner = cell[int(ch * .18):int(ch * .82), int(cw * .10):int(cw * .90)] < 135
+    ys, xs = np.where(inner)
+    if len(xs) < 8 or np.std(xs) == 0 or np.std(ys) == 0:
+        return False, 0.0
+    corr = float(np.corrcoef(xs, ys)[0, 1])
+    row_widths = [xs[ys == y_r].max() - xs[ys == y_r].min() + 1 for y_r in np.unique(ys)]
+    max_w = float(np.max(row_widths))
+    y_span = (ys.max() - ys.min() + 1) / inner.shape[0]
+    is_slash = abs(corr) >= 0.88 and max_w <= max(8.0, cw * 0.08) and y_span >= 0.45
+    return is_slash, corr
 
 
 async def read_table_cells(image: Image.Image, struct: dict) -> dict:
@@ -384,15 +446,33 @@ async def read_table_cells(image: Image.Image, struct: dict) -> dict:
     gray = np.array(image.convert("L"))
     INK_THRESHOLD = 3.0  # % dunkle Pixel
 
-    def cell_ink(row_idx, col_idx, center=False):
+    def _cell_box(row_idx, col_idx):
         cy = row_cy[row_idx]
-        box = (
+        return (
             max(0, int(centers[col_idx] - half_w)),
             max(0, int(cy - row_h * 0.55)),
             min(w_img, int(centers[col_idx] + half_w)),
             min(h_img, int(cy + row_h * 0.55)),
         )
-        return _ink_ratio(gray, box, center=center)
+
+    # Mehrzeilige diagonale Durchstreich-Striche (/ oder \) erkennen,
+    # die ueber >= 2 aufeinanderfolgende Zeilen laufen.
+    slash_cells = set()
+    for col_idx in (0, 1, 3, 4):
+        col_slashes = [_is_slash_cell(gray, _cell_box(r, col_idx)) for r in range(9)]
+        for r in range(9):
+            sl, corr = col_slashes[r]
+            if not sl:
+                continue
+            prev_ok = r > 0 and col_slashes[r - 1][0] and (col_slashes[r - 1][1] * corr > 0)
+            next_ok = r < 8 and col_slashes[r + 1][0] and (col_slashes[r + 1][1] * corr > 0)
+            if prev_ok or next_ok:
+                slash_cells.add((r, col_idx))
+
+    def cell_ink(row_idx, col_idx, center=False):
+        if (row_idx, col_idx) in slash_cells:
+            return 0.0
+        return _ink_ratio(gray, _cell_box(row_idx, col_idx), center=center)
 
     def cell_has_ink(row_idx, col_idx):
         # Zellmitte: Bleed aus Nachbarzellen faellt dort raus
@@ -489,6 +569,29 @@ async def read_table_cells(image: Image.Image, struct: dict) -> dict:
                             "(durchgestrichen/halluziniert, Summe stimmt jetzt)",
                             k, zeilen[i][k], zeilen[i]["kategorie"])
                 zeilen[i][k] = None
+            elif (total - target) % 10 == 0:
+                key_to_col = {"station_1_links": 0, "station_2_rechts": 1}
+
+                def _x_span_ratio(r_idx, c_idx):
+                    x0, y0, x1, y1 = _cell_box(r_idx, c_idx)
+                    cell = gray[y0:y1, x0:x1]
+                    ch, cw = cell.shape
+                    inner = cell[int(ch * .22):int(ch * .78), int(cw * .12):int(cw * .88)] < 125
+                    _, xs = np.where(inner)
+                    return (xs.max() - xs.min() + 1) / inner.shape[1] if len(xs) > 5 else 0.0
+
+                narrow_teens = [
+                    (i, k) for i, k in filled
+                    if 11 <= _num(zeilen[i][k]) <= 19
+                    and _x_span_ratio(i, key_to_col[k]) < 0.32
+                ]
+                if len(narrow_teens) * 10 == total - target:
+                    for i, k in narrow_teens:
+                        old_v = zeilen[i][k]
+                        zeilen[i][k] = str(_num(old_v) - 10)
+                        logger.info("Checksum: %s=%s -> %s in Zeile %s korrigiert "
+                                    "(einzelne Ziffer, Summe stimmt jetzt)",
+                                    k, old_v, zeilen[i][k], zeilen[i]["kategorie"])
             elif fixes:
                 logger.warning("Checksum: Summe %d > %d, mehrere moegliche "
                                "Fix-Zellen %s - keine automatische Korrektur",
