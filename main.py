@@ -241,20 +241,26 @@ def detect_table_structure(image: Image.Image) -> Optional[dict]:
     b, a = np.polyfit(idxs, cys, 1)
 
     # --- Spaltenzentren aus Header-Labels ---
+    # Nur Tokens oberhalb der ersten Datenzeile akzeptieren und auf der
+    # korrekten Seite der Kategorie-Spalte (verhindert z.B. "scorecard"/
+    # "scored by" als "Ringe score"-Treffer)
+    top_anchor = min(anchors.values())
     header = {"s1": None, "s2": None, "tr": None, "rg": None}
     for it in items:
+        if it["cy"] >= top_anchor:
+            continue  # nicht im Header-Bereich
         t = it["text"].lower()
-        if "station" in t or "slation" in t:
+        if ("station" in t or "slation" in t) and it["cx"] < cat_x:
             if "2" in t or "+" in t:
                 header["s2"] = it["cx"]
             elif "1" in t or header["s1"] is None:
                 header["s1"] = it["cx"]
-        elif "+" in t or t.replace(" ", "") == "2+3":
+        elif it["cx"] < cat_x and ("+" in t or t.replace(" ", "") == "2+3"):
             # Header-Token "2 + 3" steht separat unter "station"
             header["s2"] = it["cx"]
-        elif "treffer" in t or "hits" in t:
+        elif it["cx"] > cat_x and ("treffer" in t or "hits" in t):
             header["tr"] = it["cx"]
-        elif "ringe" in t or "score" in t:
+        elif it["cx"] > cat_x and ("ringe" in t or "score" in t):
             header["rg"] = it["cx"]
 
     if header["s1"] is not None and header["s2"] is not None:
@@ -290,19 +296,43 @@ def detect_table_structure(image: Image.Image) -> Optional[dict]:
     }
 
 
+def _estimate_tilt(image: Image.Image, max_deg: float = 8.0, step: float = 0.25) -> float:
+    """
+    Schaetzt die Verkippung der Tabelle: rotiert probehalber und maximiert
+    die Varianz der horizontalen Dunkel-Pixel-Projektion (Gitterlinien
+    ergeben scharfe Peaks wenn sie horizontal ausgerichtet sind).
+    """
+    import numpy as np
+
+    small = image.convert("L")
+    if small.width > 700:
+        small = small.resize((700, max(1, int(small.height * 700 / small.width))),
+                             Image.Resampling.BILINEAR)
+    best_ang, best_std = 0.0, -1.0
+    ang = -max_deg
+    while ang <= max_deg + 1e-9:
+        rot = small.rotate(ang, resample=Image.Resampling.BILINEAR,
+                           expand=False, fillcolor=255)
+        std = float((np.array(rot) < 140).sum(axis=1).std())
+        if std > best_std:
+            best_std, best_ang = std, ang
+        ang += step
+    return best_ang
+
+
 PROMPT_SPALTE = """Du siehst die Ergebnis-Tabelle einer Schiess-Scorecard.
 5 Spalten: "station 1" | "station 2 + 3" | Kategorie(grau) | "Treffer" | "Ringe".
-9 Daten-Zeilen von oben nach unten: X, 10, 9, 8, 7, 6, 5, 0, miss.
+Die Zeilen-Kategorien (grau): X, 10, 9, 8, 7, 6, 5, 0, miss.
 
 AUFGABE: Lies NUR die handschriftlichen Zahlen in der Spalte "{col_name}".
-Von oben nach unten, exakt 9 Eintraege.
+Ordne jeden Wert der Kategorie seiner Zeile zu.
 
-Antworte NUR als JSON:
-{{"{key}":["ZAHL",null,"ZAHL",null,null,null,null,null,null]}}
+Antworte NUR als JSON-Objekt mit allen 9 Kategorien als Schluessel:
+{{"X":"ZAHL","10":null,"9":null,"8":null,"7":null,"6":null,"5":null,"0":null,"miss":null}}
 
 "ZAHL" ist ein PLATZHALTER - ersetze ihn durch die Zahl die du wirklich im Bild siehst.
-null = leere Zelle. Gib NICHT einfach das Beispiel zurueck!
-Wenn eine handschriftliche Zahl zu sehen ist, MUSS sie in der Liste stehen.
+null = leere oder durchgestrichene/unkenntliche Zelle.
+Die gedruckten Kategorie-Labels (X,10,9,...) sind KEINE Werte - nicht als Wert ausgeben!
 """
 
 PROMPT_TOTALZEILE = """Du siehst die Ergebnis-Tabelle einer Schiess-Scorecard.
@@ -316,14 +346,20 @@ Antworte NUR als JSON:
 """
 
 
-def _ink_ratio(gray, box) -> float:
-    """Dunkler-Pixel-Anteil im inneren 80% einer Zelle (Gitterlinien ignoriert)."""
+def _ink_ratio(gray, box, center=False) -> float:
+    """Dunkler-Pixel-Anteil in einer Zelle.
+    center=True misst nur die Zellmitte (innerste 40%x50%) - dort schlaegt
+    Ueberlauf-Tinte aus Nachbarzellen nicht zu, echte Handschrift schon.
+    """
     x0, y0, x1, y1 = box
     cell = gray[y0:y1, x0:x1]
     ch, cw = cell.shape
     if ch < 5 or cw < 5:
         return 0.0
-    inner = cell[int(ch * .15):int(ch * .85), int(cw * .10):int(cw * .90)]
+    if center:
+        inner = cell[int(ch * .25):int(ch * .75), int(cw * .30):int(cw * .70)]
+    else:
+        inner = cell[int(ch * .15):int(ch * .85), int(cw * .10):int(cw * .90)]
     if inner.size == 0:
         return 0.0
     return float((inner < 110).mean() * 100)
@@ -348,7 +384,7 @@ async def read_table_cells(image: Image.Image, struct: dict) -> dict:
     gray = np.array(image.convert("L"))
     INK_THRESHOLD = 3.0  # % dunkle Pixel
 
-    def cell_has_ink(row_idx, col_idx):
+    def cell_ink(row_idx, col_idx, center=False):
         cy = row_cy[row_idx]
         box = (
             max(0, int(centers[col_idx] - half_w)),
@@ -356,40 +392,47 @@ async def read_table_cells(image: Image.Image, struct: dict) -> dict:
             min(w_img, int(centers[col_idx] + half_w)),
             min(h_img, int(cy + row_h * 0.55)),
         )
-        return _ink_ratio(gray, box) >= INK_THRESHOLD
+        return _ink_ratio(gray, box, center=center)
 
-    # Enger Tabellen-Crop ohne Seitenspalte, vergroessert
+    def cell_has_ink(row_idx, col_idx):
+        # Zellmitte: Bleed aus Nachbarzellen faellt dort raus
+        return cell_ink(row_idx, col_idx, center=True) >= 2.0
+
+    # Enger Tabellen-Crop ohne Seitenspalte. Fuer Spalten-Calls endet der
+    # Crop unterhalb der miss-Zeile - die total-Zeile wuerde sonst in die
+    # letzten Eintraege "hineinbluten". Der total-Call nutzt das volle Grid.
     top = max(0, int(row_cy[0] - row_h * 1.5))
-    bot = min(h_img, int(row_cy[9] + row_h * 1.2))
+    bot_data = min(h_img, int(row_cy[8] + row_h * 1.2))   # bis miss
+    bot_full = min(h_img, int(row_cy[9] + row_h * 1.2))   # inkl. total
     gx0 = max(0, int(centers[0] - half_w))
     gx1 = min(w_img, int(centers[4] + half_w))
-    if gx1 - gx0 < 50 or bot - top < 50:
+    if gx1 - gx0 < 50 or bot_full - top < 50:
         logger.warning("Ungueltige Grid-Geometrie - Fallback auf LLM-Gesamtbild")
         return {"zeilen": []}
-    grid = image.crop((gx0, top, gx1, bot))
-    gw, gh = grid.size
-    if gw < 1200:
-        grid = grid.resize((int(gw * 1.6), int(gh * 1.6)), Image.Resampling.LANCZOS)
-    grid_b64 = encode_image(grid)
 
-    async def col_list(key, name):
-        data = await query_ollama(grid_b64, PROMPT_SPALTE.format(col_name=name, key=key), num_predict=512)
-        lst = data.get(key)
-        if not isinstance(lst, list):
-            for v in data.values():
-                if isinstance(v, list):
-                    lst = v
-                    break
-        return lst if isinstance(lst, list) else []
+    def _grid_b64(bot):
+        grid = image.crop((gx0, top, gx1, bot))
+        gw, gh = grid.size
+        if gw < 1200:
+            grid = grid.resize((int(gw * 1.6), int(gh * 1.6)), Image.Resampling.LANCZOS)
+        return encode_image(grid)
+
+    data_b64 = _grid_b64(bot_data)
+    full_b64 = _grid_b64(bot_full) if bot_full != bot_data else data_b64
+
+    async def col_list(name):
+        # Rueckgabe: Dict Kategorie -> Wert (oder {})
+        return await query_ollama(
+            data_b64, PROMPT_SPALTE.format(col_name=name), num_predict=512)
 
     # Spalten-Gate: nur Spalten fragen, in denen mindestens eine Zelle Tinte hat
-    col_defs = [(0, "station_1", "station 1"), (1, "station_2", "station 2 + 3"),
-                (3, "treffer", "Treffer hits"), (4, "ringe", "Ringe score")]
+    col_defs = [(0, "station 1"), (1, "station 2 + 3"),
+                (3, "Treffer hits"), (4, "Ringe score")]
     jobs = {}
-    for col_idx, key, name in col_defs:
+    for col_idx, name in col_defs:
         if any(cell_has_ink(i, col_idx) for i in range(9)):
-            jobs[col_idx] = col_list(key, name)
-    jobs["total"] = query_ollama(grid_b64, PROMPT_TOTALZEILE, num_predict=256)
+            jobs[col_idx] = col_list(name)
+    jobs["total"] = query_ollama(full_b64, PROMPT_TOTALZEILE, num_predict=256)
 
     results = await asyncio.gather(*jobs.values())
     lists = dict(zip(jobs.keys(), results))
@@ -403,22 +446,60 @@ async def read_table_cells(image: Image.Image, struct: dict) -> dict:
         row = {"kategorie": cat}
         for col_idx, key in col_keys.items():
             val = None
-            lst = lists.get(col_idx) or []
-            if idx < len(lst):
-                v = _coerce_str(lst[idx])
-                # Wert nur akzeptieren wenn Format stimmt UND Zelle Tinte hat
-                if v and _valid(v) and cell_has_ink(idx, col_idx):
+            d = lists.get(col_idx) or {}
+            if cat in d:
+                v = _coerce_str(d.get(cat))
+                ink = cell_ink(idx, col_idx, center=True)
+                if v and _valid(v) and ink >= INK_THRESHOLD:
                     val = v
             row[key] = val
         zeilen.append(row)
 
     td = lists.get("total") or {}
-    return {
-        "zeilen": zeilen,
+    totals = {
         "station_1_total": _coerce_str(td.get("station_1_total")),
         "station_2_total": _coerce_str(td.get("station_2_total")),
         "treffer_gesamt": _coerce_str(td.get("treffer_gesamt")),
         "ringe_gesamt": _coerce_str(td.get("ringe_gesamt")),
+    }
+
+    # Checksum: die Stationswerte (Anzahl Schuesse je Kategorie) muessen sich
+    # zum gedruckten treffer_gesamt addieren. Ist die Summe zu gross, ist ein
+    # gelesener Wert ueberzaehlig (z.B. durchgestrichener Eintrag oder
+    # Halluzination) - die Zelle, deren Entfernen die Summe exakt macht,
+    # wird genullt (nur wenn sie eindeutig bestimmbar ist).
+    m = re.match(r"\d+", totals.get("treffer_gesamt") or "")
+    if m:
+        target = int(m.group(0))
+
+        def _num(v):
+            mm = re.match(r"\d+", v or "")
+            return int(mm.group(0)) if mm else None
+
+        filled = [(i, k) for i, r in enumerate(zeilen)
+                  for k in ("station_1_links", "station_2_rechts")
+                  if _num(r.get(k)) is not None]
+        total = sum(_num(zeilen[i][k]) for i, k in filled)
+        if total > target:
+            fixes = [(i, k) for i, k in filled
+                     if total - _num(zeilen[i][k]) == target]
+            if len(fixes) == 1:
+                i, k = fixes[0]
+                logger.info("Checksum: %s=%s in Zeile %s verworfen "
+                            "(durchgestrichen/halluziniert, Summe stimmt jetzt)",
+                            k, zeilen[i][k], zeilen[i]["kategorie"])
+                zeilen[i][k] = None
+            elif fixes:
+                logger.warning("Checksum: Summe %d > %d, mehrere moegliche "
+                               "Fix-Zellen %s - keine automatische Korrektur",
+                               total, target, fixes)
+        elif total < target:
+            logger.warning("Checksum: Summe %d < treffer_gesamt %d - "
+                           "vermutlich fehlende Werte", total, target)
+
+    return {
+        "zeilen": zeilen,
+        **totals,
     }
 
 
@@ -577,6 +658,12 @@ async def process_scorecard(file: UploadFile = File(...)) -> ScorecardAuswertung
     # --- Tabelle: EasyOCR liefert Geometrie, LLM liest nur Zellen mit Tinte ---
     tabelle_data = {}
     if USE_EASYOCR:
+        tilt = _estimate_tilt(tabelle_img)
+        if abs(tilt) >= 0.5:
+            logger.info("Tabelle um %.2f Grad entkippt", tilt)
+            tabelle_img = tabelle_img.rotate(
+                tilt, resample=Image.Resampling.BICUBIC, expand=False,
+                fillcolor=(255, 255, 255))
         struct = detect_table_structure(tabelle_img)
         if struct:
             tabelle_data = await read_table_cells(tabelle_img, struct)
