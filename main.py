@@ -797,7 +797,8 @@ async def read_table_cells(image: Image.Image, struct: dict) -> dict:
 
     # Wenn beide Stationsspalten aktiv sind (z.B. NPA linke & rechte Scheibe),
     # muessen station_1_total, station_2_total, treffer_gesamt und ringe_gesamt
-    # zu den gelesenen Spaltensummen passen (verhindert PP1-Beispielwerte aus dem Prompt).
+    # zu den Spaltensummen bzw. der gedruckten Total-Zeile passen.
+    max_ring = int(cats_data[1]) if len(cats_data) > 1 and cats_data[1].isdigit() else 10
     s1_nums = [_num(r.get("station_1_links")) for r in zeilen if _num(r.get("station_1_links")) is not None]
     s2_nums = [_num(r.get("station_2_rechts")) for r in zeilen if _num(r.get("station_2_rechts")) is not None]
     if s1_nums and s2_nums:
@@ -806,6 +807,10 @@ async def read_table_cells(image: Image.Image, struct: dict) -> dict:
         totals["station_1_total"] = str(s1_sum)
         totals["station_2_total"] = str(s2_sum)
         totals["treffer_gesamt"] = str(s1_sum + s2_sum)
+        if ocr_totals[4] and _num(ocr_totals[4]) != s1_sum + s2_sum:
+            totals["ringe_gesamt"] = ocr_totals[4]
+        else:
+            totals["ringe_gesamt"] = str((s1_sum + s2_sum) * max_ring)
 
     # Checksum: die Stationswerte (Anzahl Schuesse je Kategorie) muessen sich
     # zum gedruckten treffer_gesamt addieren. Ist die Summe zu gross, ist ein
@@ -859,23 +864,27 @@ async def read_table_cells(image: Image.Image, struct: dict) -> dict:
             logger.warning("Checksum: Summe %d < treffer_gesamt %d - "
                            "vermutlich fehlende Werte", total, target)
 
-    # Ringe-Gesamtsumme aus den Zeilenwerten berechnen/validieren
-    max_ring = int(cats_data[1]) if len(cats_data) > 1 and cats_data[1].isdigit() else 10
-    ringe_sum = 0
-    for r in zeilen:
-        cat = r["kategorie"]
-        ring_val = max_ring if cat.upper() == "X" else (int(cat) if cat.isdigit() else 0)
-        c1 = _num(r.get("station_1_links")) or 0
-        c2 = _num(r.get("station_2_rechts")) or 0
-        ct = _num(r.get("treffer")) or 0
-        shots = (c1 + c2) if (c1 or c2) else ct
-        ringe_sum += ring_val * shots
-    if ringe_sum > 0 and (
-        not totals.get("ringe_gesamt")
-        or (s1_nums and s2_nums)
-        or (_num(totals.get("ringe_gesamt")) == 300 and ringe_sum != 300)
-    ):
-        totals["ringe_gesamt"] = str(ringe_sum)
+    s1_final = [_num(r.get("station_1_links")) for r in zeilen if _num(r.get("station_1_links")) is not None]
+    s2_final = [_num(r.get("station_2_rechts")) for r in zeilen if _num(r.get("station_2_rechts")) is not None]
+    tr_final = [_num(r.get("treffer")) for r in zeilen if _num(r.get("treffer")) is not None]
+    rg_final = [_num(r.get("ringe")) for r in zeilen if _num(r.get("ringe")) is not None]
+    zeilen.append({
+        "kategorie": "total",
+        "station_1_links": (
+            str(sum(s1_final)) if (cell_ink(n_rows, 0, center=True) >= INK_THRESHOLD and s1_final) else None
+        ),
+        "station_2_rechts": (
+            str(sum(s2_final)) if (cell_ink(n_rows, 1, center=True) >= INK_THRESHOLD and s2_final) else None
+        ),
+        "treffer": (
+            str(sum(tr_final) if tr_final else sum(s1_final) + sum(s2_final))
+            if (cell_ink(n_rows, 3, center=True) >= INK_THRESHOLD and (tr_final or s1_final or s2_final))
+            else None
+        ),
+        "ringe": (
+            str(sum(rg_final)) if (cell_ink(n_rows, 4, center=True) >= INK_THRESHOLD and rg_final) else None
+        ),
+    })
 
     return {
         "zeilen": zeilen,
