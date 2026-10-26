@@ -595,7 +595,12 @@ def _is_slash_cell(gray, box) -> tuple[bool, float]:
     ch, cw = cell.shape
     if ch < 5 or cw < 5:
         return False, 0.0
-    inner = cell[int(ch * .18):int(ch * .82), int(cw * .10):int(cw * .90)] < 135
+    inner = cell[int(ch * .22):int(ch * .78), int(cw * .12):int(cw * .88)] < 135
+    if inner.size == 0:
+        return False, 0.0
+    inner = inner[inner.mean(axis=1) < 0.30]
+    if inner.size == 0:
+        return False, 0.0
     ys, xs = np.where(inner)
     if len(xs) < 8 or np.std(xs) == 0 or np.std(ys) == 0:
         return False, 0.0
@@ -663,8 +668,10 @@ async def read_table_cells(image: Image.Image, struct: dict) -> dict:
     top = max(0, int(row_cy[0] - row_h * 1.5))
     bot_data = min(h_img, int(row_cy[n_rows - 1] + row_h * 1.2))   # bis miss
     bot_full = min(h_img, int(row_cy[n_rows] + row_h * 1.2))       # inkl. total
-    gx0 = max(0, int(centers[0] - half_w))
-    gx1 = min(w_img, int(centers[4] + half_w))
+    is_small_table = (centers[4] - centers[0] + 2 * half_w) < 600
+    pad_w = half_w * 1.05 if is_small_table else half_w
+    gx0 = max(0, int(centers[0] - pad_w))
+    gx1 = min(w_img, int(centers[4] + pad_w))
     if gx1 - gx0 < 50 or bot_full - top < 50:
         logger.warning("Ungueltige Grid-Geometrie - Fallback auf LLM-Gesamtbild")
         return {"zeilen": []}
@@ -677,8 +684,9 @@ async def read_table_cells(image: Image.Image, struct: dict) -> dict:
     def _encode_resized(crop_img: Image.Image) -> str:
         gw, gh = crop_img.size
         if gw < 1200:
+            scale = max(1.6, 1000.0 / gw) if is_small_table else 1.6
             crop_img = crop_img.resize(
-                (int(gw * 1.6), int(gh * 1.6)), Image.Resampling.LANCZOS
+                (int(gw * scale), int(gh * scale)), Image.Resampling.LANCZOS
             )
         return encode_image(crop_img)
 
@@ -686,16 +694,34 @@ async def read_table_cells(image: Image.Image, struct: dict) -> dict:
         # Isoliert die abgefragte linke/rechte Wert-Spalte direkt neben der
         # grauen Kategorie-Spalte, damit das VLM bei beidseitig ausgefuellten
         # Tabellen (z.B. NPA linke/rechte Scheibe) nicht die Nachbarspalte liest.
+        isolated = col_idx in (0, 1) and (col_idx == 1 or bool(active_by_col[1]))
+        src_img = image
+        if isolated:
+            from PIL import ImageDraw
+            src_img = image.copy()
+            draw = ImageDraw.Draw(src_img)
+            active_set = set(active_by_col[col_idx])
+            for r in range(n_rows):
+                if r not in active_set:
+                    draw.rectangle(
+                        (
+                            int(centers[col_idx] - half_w * 0.85),
+                            int(row_cy[r] - row_h * 0.38),
+                            int(centers[col_idx] + half_w * 0.85),
+                            int(row_cy[r] + row_h * 0.38),
+                        ),
+                        fill=(255, 255, 255),
+                    )
         if col_idx == 1:
-            grid = image.crop((max(0, int(centers[1] - half_w)), top, gx1, bot_data))
+            grid = src_img.crop((max(0, int(centers[1] - half_w)), top, gx1, bot_data))
         elif col_idx == 0 and active_by_col[1]:
-            left_p = image.crop((gx0, top, min(w_img, int(centers[0] + half_w)), bot_data))
-            right_p = image.crop((max(0, int(centers[2] - half_w * 0.80)), top, gx1, bot_data))
+            left_p = src_img.crop((gx0, top, min(w_img, int(centers[0] + half_w)), bot_data))
+            right_p = src_img.crop((max(0, int(centers[2] - half_w * 0.80)), top, gx1, bot_data))
             grid = Image.new("RGB", (left_p.width + right_p.width, left_p.height), (255, 255, 255))
             grid.paste(left_p, (0, 0))
             grid.paste(right_p, (left_p.width, 0))
         else:
-            grid = image.crop((gx0, top, gx1, bot_data))
+            grid = src_img.crop((gx0, top, gx1, bot_data))
         return _encode_resized(grid)
 
     full_b64 = _encode_resized(image.crop((gx0, top, gx1, bot_full)))
@@ -704,22 +730,51 @@ async def read_table_cells(image: Image.Image, struct: dict) -> dict:
     tmpl_parts = [f'"{cats_data[0]}":"ZAHL"'] + [f'"{c}":null' for c in cats_data[1:]]
     tmpl_json = "{" + ",".join(tmpl_parts) + "}"
 
+    def _valid(v):
+        return (isinstance(v, str)
+                and v.upper() != "ZAHL"
+                and bool(re.fullmatch(r"[\d()xX\-]+", v)))
+
     async def col_list(col_idx: int, name: str):
         isolated = col_idx in (0, 1) and (col_idx == 1 or bool(active_by_col[1]))
+        active = active_by_col[col_idx]
+        act_parts = [
+            f'"{c}":"ZAHL"' if i in active else f'"{c}":null'
+            for i, c in enumerate(cats_data)
+        ]
+        act_tmpl_json = "{" + ",".join(act_parts) + "}"
+        has_internal_gap = (
+            bool(active)
+            and 0 in active
+            and active != list(range(active[0], active[-1] + 1))
+        )
+        use_tmpl = act_tmpl_json if ((is_small_table and not isolated) or has_internal_gap) else tmpl_json
+        img_b64 = _col_b64(col_idx)
         if isolated:
             prompt = PROMPT_SPALTE_ISOLIERT.format(
                 cat_str=cat_str,
                 n_rows=n_rows,
-                tmpl_json=tmpl_json,
+                tmpl_json=use_tmpl,
             )
         else:
             prompt = PROMPT_SPALTE.format(
                 cat_str=cat_str,
                 col_name=name,
                 n_rows=n_rows,
-                tmpl_json=tmpl_json,
+                tmpl_json=use_tmpl,
             )
-        return await query_ollama(_col_b64(col_idx), prompt, num_predict=512)
+        res = await query_ollama(img_b64, prompt, num_predict=512)
+        if not isolated and use_tmpl == tmpl_json and len(active) > 1:
+            n_valid = sum(1 for r_idx in active if _valid(_coerce_str((res or {}).get(cats_data[r_idx]))))
+            if n_valid <= 1:
+                retry_prompt = PROMPT_SPALTE.format(
+                    cat_str=cat_str,
+                    col_name=name,
+                    n_rows=n_rows,
+                    tmpl_json=act_tmpl_json,
+                )
+                res = await query_ollama(img_b64, retry_prompt, num_predict=512)
+        return res
 
     # Spalten-Gate: nur Spalten fragen, in denen mindestens eine Zelle Tinte hat
     col_defs = [(0, "station 1"), (1, "station 2 + 3"),
@@ -732,11 +787,6 @@ async def read_table_cells(image: Image.Image, struct: dict) -> dict:
 
     results = await asyncio.gather(*jobs.values())
     lists = dict(zip(jobs.keys(), results))
-
-    def _valid(v):
-        return (isinstance(v, str)
-                and v.upper() != "ZAHL"
-                and bool(re.fullmatch(r"[\d()xX\-]+", v)))
 
     col_keys = {0: "station_1_links", 1: "station_2_rechts", 3: "treffer", 4: "ringe"}
     zeilen = [{"kategorie": cat} for cat in cats_data]
@@ -778,38 +828,36 @@ async def read_table_cells(image: Image.Image, struct: dict) -> dict:
         "ringe_gesamt": _clean_total(td.get("ringe_gesamt")),
     }
 
-    # EasyOCR-Tokens in der Total-Zeile als Ergaenzung/Validierung nutzen
-    total_cy = row_cy[n_rows]
+    # EasyOCR-Tokens in der grauen Fusszeile (12(10)|18(20)|30|300 bzw. 12|12|24|120)
+    footer_cy = row_cy[n_rows] + (10 - n_rows) * row_h
     ocr_totals = {0: None, 1: None, 3: None, 4: None}
     for it in struct.get("items") or []:
-        if abs(it["cy"] - total_cy) <= row_h * 0.65 and re.fullmatch(r"[\d()]+", it["text"].strip()):
+        if abs(it["cy"] - footer_cy) <= row_h * 0.65 and re.fullmatch(r"[\d() ]+", it["text"].strip()):
             for c_idx in (0, 1, 3, 4):
                 if abs(it["cx"] - centers[c_idx]) <= half_w * 1.1:
-                    ocr_totals[c_idx] = it["text"].strip()
+                    ocr_totals[c_idx] = it["text"].strip().replace(" ", "")
     for c_idx, t_key in ((0, "station_1_total"), (1, "station_2_total"),
                          (3, "treffer_gesamt"), (4, "ringe_gesamt")):
-        if not totals[t_key] and ocr_totals[c_idx]:
+        if (not totals[t_key] or n_rows != 9) and ocr_totals[c_idx]:
             totals[t_key] = ocr_totals[c_idx]
 
     def _num(v):
         mm = re.match(r"\d+", v or "")
         return int(mm.group(0)) if mm else None
 
-    # Wenn beide Stationsspalten aktiv sind (z.B. NPA linke & rechte Scheibe),
-    # muessen station_1_total, station_2_total, treffer_gesamt und ringe_gesamt
-    # zu den Spaltensummen bzw. der gedruckten Total-Zeile passen.
     max_ring = int(cats_data[1]) if len(cats_data) > 1 and cats_data[1].isdigit() else 10
     s1_nums = [_num(r.get("station_1_links")) for r in zeilen if _num(r.get("station_1_links")) is not None]
     s2_nums = [_num(r.get("station_2_rechts")) for r in zeilen if _num(r.get("station_2_rechts")) is not None]
-    if s1_nums and s2_nums:
+    if s1_nums and s2_nums and n_rows != 9:
         s1_sum = sum(s1_nums)
         s2_sum = sum(s2_nums)
-        totals["station_1_total"] = str(s1_sum)
-        totals["station_2_total"] = str(s2_sum)
-        totals["treffer_gesamt"] = str(s1_sum + s2_sum)
-        if ocr_totals[4] and _num(ocr_totals[4]) != s1_sum + s2_sum:
-            totals["ringe_gesamt"] = ocr_totals[4]
-        else:
+        if not ocr_totals[0]:
+            totals["station_1_total"] = str(s1_sum)
+        if not ocr_totals[1]:
+            totals["station_2_total"] = str(s2_sum)
+        if not ocr_totals[3]:
+            totals["treffer_gesamt"] = str(s1_sum + s2_sum)
+        if not ocr_totals[4]:
             totals["ringe_gesamt"] = str((s1_sum + s2_sum) * max_ring)
 
     # Checksum: die Stationswerte (Anzahl Schuesse je Kategorie) muessen sich
@@ -827,6 +875,17 @@ async def read_table_cells(image: Image.Image, struct: dict) -> dict:
         if total > target:
             fixes = [(i, k) for i, k in filled
                      if total - _num(zeilen[i][k]) == target]
+            key_to_col = {"station_1_links": 0, "station_2_rechts": 1}
+            if len(fixes) > 1:
+                ranked = sorted(
+                    fixes,
+                    key=lambda ik: cell_ink(ik[0], key_to_col[ik[1]], center=True),
+                    reverse=True,
+                )
+                ink0 = cell_ink(ranked[0][0], key_to_col[ranked[0][1]], center=True)
+                ink1 = cell_ink(ranked[1][0], key_to_col[ranked[1][1]], center=True)
+                if ink0 >= ink1 * 1.3:
+                    fixes = [ranked[0]]
             if len(fixes) == 1:
                 i, k = fixes[0]
                 logger.info("Checksum: %s=%s in Zeile %s verworfen "
@@ -834,7 +893,6 @@ async def read_table_cells(image: Image.Image, struct: dict) -> dict:
                             k, zeilen[i][k], zeilen[i]["kategorie"])
                 zeilen[i][k] = None
             elif (total - target) % 10 == 0:
-                key_to_col = {"station_1_links": 0, "station_2_rechts": 1}
 
                 def _x_span_ratio(r_idx, c_idx):
                     x0, y0, x1, y1 = _cell_box(r_idx, c_idx)
