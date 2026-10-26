@@ -202,106 +202,271 @@ def detect_table_structure(image: Image.Image) -> Optional[dict]:
     reader = detect_table_structure._reader
 
     w, h = image.size
-    cat_lower = [c.lower() for c in KATEGORIEN]
+    arr = np.array(image)
+    gray_f = np.array(image.convert("L")).astype(float)
 
     items = []
-    for bbox, text, conf in reader.readtext(np.array(image)):
+    for bbox, text, conf in reader.readtext(arr):
         text = text.strip()
         if not text:
             continue
         xs = [p[0] for p in bbox]
         ys = [p[1] for p in bbox]
         items.append({
-            "text": text, "conf": conf,
+            "text": text, "conf": float(conf),
             "cx": sum(xs) / len(xs), "cy": sum(ys) / len(ys),
             "x0": min(xs), "x1": max(xs), "y0": min(ys), "y1": max(ys),
         })
     if not items:
         return None
 
-    cat_tokens = [it for it in items if it["text"].lower() in cat_lower]
-    if len(cat_tokens) < 2:
-        logger.warning("EasyOCR: weniger als 2 Kategorie-Labels erkannt")
-        return None
+    # --- Dynamische Kategorien & Zeilenanzahl bestimmen ---
+    miss_its = [it for it in items
+                if it["text"].lower() == "miss" and it["conf"] >= 0.35 and it["cy"] > 0.3 * h]
+    total_its = [it for it in items
+                 if it["text"].lower() == "total" and it["conf"] >= 0.35 and it["cy"] > 0.3 * h]
 
-    mt_xs = [it["cx"] for it in items
-             if it["text"].lower() in ("miss", "total") and it["conf"] >= 0.5]
-    if mt_xs:
-        cat_x = sum(mt_xs) / len(mt_xs)
+    if miss_its and total_its:
+        miss_it = max(miss_its, key=lambda x: x["conf"])
+        total_it = max(total_its, key=lambda x: x["conf"])
+        cat_x = (miss_it["cx"] + total_it["cx"]) / 2.0
+        zero_its = [
+            it for it in items
+            if it["text"] == "0" and abs(it["cx"] - cat_x) <= 0.06 * w
+            and 0 < miss_it["cy"] - it["cy"] < 0.15 * h and it["conf"] >= 0.35
+        ]
+        row_h_0 = ((total_it["cy"] - zero_its[0]["cy"]) / 2.0
+                   if zero_its else (total_it["cy"] - miss_it["cy"]))
+
+        hdr_keywords = (
+            "station", "slation", "linke", "tinke", "iinke",
+            "rechte", "techte", "scheibe", "schelbe", "schelbo",
+            "treffer", "trerier", "hits", "ringe", "score",
+        )
+        hdr_tokens = [
+            it for it in items
+            if it["cy"] < miss_it["cy"] - 2.5 * row_h_0
+            and it["cx"] > 0.12 * w
+            and any(k in it["text"].lower() for k in hdr_keywords)
+        ]
+        header_cy = (sum(it["cy"] for it in hdr_tokens) / len(hdr_tokens)
+                     if hdr_tokens else 0.18 * h)
+
+        x_its = [
+            it for it in items
+            if it["text"].upper() == "X" and abs(it["cx"] - cat_x) <= 0.06 * w
+            and header_cy + 0.3 * row_h_0 < it["cy"] < miss_it["cy"] - 3.0 * row_h_0
+            and it["conf"] >= 0.4
+        ]
+        if x_its:
+            n_data_rows = max(5, min(12, round((total_it["cy"] - x_its[0]["cy"]) / row_h_0)))
+            row_h_0 = (total_it["cy"] - x_its[0]["cy"]) / n_data_rows
+        elif hdr_tokens:
+            n_data_rows = max(5, min(12, round((total_it["cy"] - header_cy) / row_h_0) - 1))
+            row_h_0 = (total_it["cy"] - header_cy) / (n_data_rows + 1.15)
+        else:
+            n_data_rows = 9
+
+        # Zeilenhoehe ueber Druckzeichen-Signal in der Kategoriespalte feinjustieren
+        r_in = max(6, int(row_h_0 * 0.26))
+        r_out1 = max(r_in + 3, int(row_h_0 * 0.38))
+        r_out2 = max(r_out1 + 4, int(row_h_0 * 0.68))
+        c_prof = gray_f[:, max(0, int(cat_x - r_in)):min(w, int(cat_x + r_in))].mean(axis=1)
+        s_prof = 0.5 * (
+            gray_f[:, max(0, int(cat_x - r_out2)):max(1, int(cat_x - r_out1))].mean(axis=1)
+            + gray_f[:, min(w - 1, int(cat_x + r_out1)):min(w, int(cat_x + r_out2))].mean(axis=1)
+        )
+        char_sig = np.maximum(0.0, s_prof - c_prof)
+        best_rh = max(
+            np.linspace(row_h_0 * 0.94, row_h_0 * 1.06, 61),
+            key=lambda rh: sum(
+                char_sig[max(0, int(round(total_it["cy"] - k * rh)) - 6):
+                         min(h, int(round(total_it["cy"] - k * rh)) + 7)].mean()
+                for k in range(2, n_data_rows + 1)
+            ),
+        )
+
+        # Gedruckte Zahlen-Kategorien zwischen "X" und "0" bestimmen
+        hbox_list = [
+            [
+                max(0, int(cat_x - best_rh * 0.65)),
+                min(w, int(cat_x + best_rh * 0.65)),
+                max(0, int((total_it["cy"] - k * best_rh) - best_rh * 0.36)),
+                min(h, int((total_it["cy"] - k * best_rh) + best_rh * 0.36)),
+            ]
+            for k in range(n_data_rows, 1, -1)
+        ]
+        rec_cats = reader.recognize(
+            arr, horizontal_list=hbox_list, free_list=[], allowlist="0123456789X"
+        )
+        offset_votes = []
+        for it in items:
+            if abs(it["cx"] - cat_x) <= 0.06 * w and it["conf"] >= 0.5 and it["text"].isdigit():
+                val = int(it["text"])
+                k = round((total_it["cy"] - it["cy"]) / best_rh)
+                if (3 <= k <= n_data_rows - 1 and 1 <= val <= 10
+                        and abs((total_it["cy"] - it["cy"]) - k * best_rh) <= 0.25 * best_rh):
+                    offset_votes.append(val - k)
+        for k, (_, txt, conf) in zip(range(n_data_rows, 1, -1), rec_cats):
+            if 3 <= k <= n_data_rows - 1 and conf >= 0.75 and txt.isdigit():
+                val = int(txt)
+                if 1 <= val <= 10:
+                    offset_votes.append(val - k)
+        offset = (max(set(offset_votes), key=offset_votes.count)
+                  if offset_votes else (2 if n_data_rows == 9 else n_data_rows - 8))
+        categories = (
+            ["X"]
+            + [str(offset + k) for k in range(n_data_rows - 1, 2, -1)]
+            + ["0", "miss", "total"]
+        )
     else:
-        cat_x = sorted(t["cx"] for t in cat_tokens)[len(cat_tokens) // 2]
+        categories = list(KATEGORIEN)
+        n_data_rows = 9
 
-    anchors = {}
-    for it in cat_tokens:
-        box_h = it["y1"] - it["y0"]
-        if (abs(it["cx"] - cat_x) <= 0.06 * w
-                and it["conf"] >= 0.35
-                and box_h <= 0.10 * h
-                and it["cy"] > 0.15 * h):
-            idx = cat_lower.index(it["text"].lower())
-            anchors.setdefault(idx, []).append(it["cy"])
-    anchors = {idx: sum(v) / len(v) for idx, v in anchors.items()}
-    if len(anchors) < 2:
-        logger.warning("EasyOCR: zu wenige Zeilen-Anker")
-        return None
-
-    # Robuster linearer Fit (filtert Ausreisser wie falsch gelesene Ziffern)
-    anchor_idxs = sorted(anchors.keys())
-    best_inliers = []
-    best_err = float("inf")
-    for i in range(len(anchor_idxs)):
-        for j in range(i + 1, len(anchor_idxs)):
-            idx1, idx2 = anchor_idxs[i], anchor_idxs[j]
-            b_cand = (anchors[idx2] - anchors[idx1]) / (idx2 - idx1)
-            if not (10.0 <= b_cand <= h * 0.25):
+    if categories != KATEGORIEN:
+        cat_lower = [c.lower() for c in categories]
+        anchors = {}
+        for it in items:
+            if it["text"].lower() not in cat_lower:
                 continue
-            a_cand = anchors[idx1] - b_cand * idx1
-            tol = max(6.0, 0.22 * b_cand)
-            inliers = [k for k in anchor_idxs
-                       if abs(anchors[k] - (a_cand + b_cand * k)) <= tol]
-            err = sum(abs(anchors[k] - (a_cand + b_cand * k)) for k in inliers) / len(inliers)
-            if (len(inliers) > len(best_inliers)
-                    or (len(inliers) == len(best_inliers) and err < best_err)):
-                best_inliers = inliers
-                best_err = err
+            box_h = it["y1"] - it["y0"]
+            if (abs(it["cx"] - cat_x) <= 0.06 * w and it["conf"] >= 0.45
+                    and box_h <= 0.10 * h and it["cy"] > header_cy):
+                idx = cat_lower.index(it["text"].lower())
+                if abs((total_it["cy"] - it["cy"]) - (n_data_rows - idx) * best_rh) <= 0.35 * best_rh:
+                    anchors.setdefault(idx, []).append(it["cy"])
+        anchors = {idx: sum(v) / len(v) for idx, v in anchors.items()}
+        for k in range(2, n_data_rows + 1):
+            idx = n_data_rows - k
+            if idx not in anchors:
+                cy0 = total_it["cy"] - k * best_rh
+                y_lo = max(0, int(round(cy0 - best_rh * 0.25)))
+                y_hi = min(h, int(round(cy0 + best_rh * 0.25)) + 1)
+                w_sig = char_sig[y_lo:y_hi]
+                if w_sig.sum() > 20.0:
+                    ys_idx = np.arange(y_lo, y_hi)
+                    anchors[idx] = float(np.sum(ys_idx * w_sig) / np.sum(w_sig))
 
-    if len(best_inliers) >= 2:
-        anchors = {k: anchors[k] for k in best_inliers}
+        idxs = np.array(sorted(anchors.keys()))
+        cys = np.array([anchors[i] for i in idxs])
+        b, a = np.polyfit(idxs, cys, 1)
+        row_cy = {idx: anchors.get(idx, a + b * idx) for idx in range(len(categories))}
 
-    # Zeilen sind gleichmaessig verteilt -> linearer Fit: cy = a + b*idx
-    idxs = np.array(list(anchors.keys()))
-    cys = np.array(list(anchors.values()))
-    b, a = np.polyfit(idxs, cys, 1)
+        top_anchor = row_cy[0]
+        header_lists = {"s1": [], "s2": [], "tr": [], "rg": []}
+        has_scheibe_hdr = False
+        for it in items:
+            if it["cy"] >= top_anchor or it["cx"] < 0.12 * w:
+                continue
+            t = it["text"].lower()
+            if ("station" in t or "slation" in t) and it["cx"] < cat_x:
+                if "2" in t or "+" in t:
+                    header_lists["s2"].append(it["cx"])
+                elif "1" in t or not header_lists["s1"]:
+                    header_lists["s1"].append(it["cx"])
+            elif it["cx"] < cat_x and ("+" in t or t.replace(" ", "") == "2+3"):
+                header_lists["s2"].append(it["cx"])
+            elif it["cx"] < cat_x and any(k in t for k in ("linke", "tinke", "iinke")):
+                header_lists["s1"].append(it["cx"])
+                has_scheibe_hdr = True
+            elif it["cx"] < cat_x and any(k in t for k in ("rechte", "techte")):
+                header_lists["s2"].append(it["cx"])
+                has_scheibe_hdr = True
+            elif it["cx"] < cat_x and any(k in t for k in ("scheibe", "schelbe", "schelbo")):
+                has_scheibe_hdr = True
+                if it["cx"] < cat_x - 0.18 * w:
+                    header_lists["s1"].append(it["cx"])
+                else:
+                    header_lists["s2"].append(it["cx"])
+            elif it["cx"] > cat_x and ("treffer" in t or "trerier" in t or "hits" in t):
+                header_lists["tr"].append(it["cx"])
+            elif it["cx"] > cat_x and ("ringe" in t or "score" in t):
+                header_lists["rg"].append(it["cx"])
 
-    # --- Spaltenzentren aus Header-Labels ---
-    # Nur Tokens oberhalb der ersten Datenzeile akzeptieren und auf der
-    # korrekten Seite der Kategorie-Spalte (verhindert z.B. "scorecard"/
-    # "scored by" als "Ringe score"-Treffer)
-    top_anchor = min(anchors.values())
-    header = {"s1": None, "s2": None, "tr": None, "rg": None}
-    for it in items:
-        if it["cy"] >= top_anchor:
-            continue  # nicht im Header-Bereich
-        t = it["text"].lower()
-        if ("station" in t or "slation" in t) and it["cx"] < cat_x:
-            if "2" in t or "+" in t:
-                header["s2"] = it["cx"]
-            elif "1" in t or header["s1"] is None:
-                header["s1"] = it["cx"]
-        elif it["cx"] < cat_x and ("+" in t or t.replace(" ", "") == "2+3"):
-            # Header-Token "2 + 3" steht separat unter "station"
-            header["s2"] = it["cx"]
-        elif it["cx"] > cat_x and ("treffer" in t or "hits" in t):
-            header["tr"] = it["cx"]
-        elif it["cx"] > cat_x and ("ringe" in t or "score" in t):
-            header["rg"] = it["cx"]
-
-    if header["s1"] is not None and header["s2"] is not None:
-        col_w = header["s2"] - header["s1"]
-    elif header["tr"] is not None:
-        col_w = header["tr"] - cat_x
+        header = {k: (sum(v) / len(v) if v else None) for k, v in header_lists.items()}
+        if header["tr"] is not None and (has_scheibe_hdr or header["s1"] is None or header["s2"] is None):
+            col_w = header["tr"] - cat_x
+        elif header["s1"] is not None and header["s2"] is not None:
+            col_w = header["s2"] - header["s1"]
+        elif header["s2"] is not None:
+            col_w = cat_x - header["s2"]
+        elif header["s1"] is not None:
+            col_w = (cat_x - header["s1"]) / 2.0
+        else:
+            col_w = w * 0.145
     else:
-        col_w = w * 0.145
+        cat_lower = [c.lower() for c in categories]
+        cat_tokens = [it for it in items if it["text"].lower() in cat_lower]
+        if len(cat_tokens) < 2:
+            logger.warning("EasyOCR: weniger als 2 Kategorie-Labels erkannt")
+            return None
+        mt_xs = [it["cx"] for it in items
+                 if it["text"].lower() in ("miss", "total") and it["conf"] >= 0.5]
+        cat_x = (sum(mt_xs) / len(mt_xs)
+                 if mt_xs else sorted(t["cx"] for t in cat_tokens)[len(cat_tokens) // 2])
+        anchors = {}
+        for it in cat_tokens:
+            box_h = it["y1"] - it["y0"]
+            if (abs(it["cx"] - cat_x) <= 0.06 * w
+                    and it["conf"] >= 0.35
+                    and box_h <= 0.10 * h
+                    and it["cy"] > 0.15 * h):
+                idx = cat_lower.index(it["text"].lower())
+                anchors.setdefault(idx, []).append(it["cy"])
+        anchors = {idx: sum(v) / len(v) for idx, v in anchors.items()}
+        if len(anchors) < 2:
+            logger.warning("EasyOCR: zu wenige Zeilen-Anker")
+            return None
+        anchor_idxs = sorted(anchors.keys())
+        best_inliers = []
+        best_err = float("inf")
+        for i in range(len(anchor_idxs)):
+            for j in range(i + 1, len(anchor_idxs)):
+                idx1, idx2 = anchor_idxs[i], anchor_idxs[j]
+                b_cand = (anchors[idx2] - anchors[idx1]) / (idx2 - idx1)
+                if not (10.0 <= b_cand <= h * 0.25):
+                    continue
+                a_cand = anchors[idx1] - b_cand * idx1
+                tol = max(6.0, 0.22 * b_cand)
+                inliers = [k for k in anchor_idxs
+                           if abs(anchors[k] - (a_cand + b_cand * k)) <= tol]
+                err = sum(abs(anchors[k] - (a_cand + b_cand * k)) for k in inliers) / len(inliers)
+                if (len(inliers) > len(best_inliers)
+                        or (len(inliers) == len(best_inliers) and err < best_err)):
+                    best_inliers = inliers
+                    best_err = err
+        if len(best_inliers) >= 2:
+            anchors = {k: anchors[k] for k in best_inliers}
+
+        idxs = np.array(list(anchors.keys()))
+        cys = np.array(list(anchors.values()))
+        b, a = np.polyfit(idxs, cys, 1)
+        row_cy = {idx: anchors.get(idx, a + b * idx) for idx in range(len(categories))}
+
+        top_anchor = min(anchors.values())
+        header = {"s1": None, "s2": None, "tr": None, "rg": None}
+        for it in items:
+            if it["cy"] >= top_anchor:
+                continue
+            t = it["text"].lower()
+            if ("station" in t or "slation" in t) and it["cx"] < cat_x:
+                if "2" in t or "+" in t:
+                    header["s2"] = it["cx"]
+                elif "1" in t or header["s1"] is None:
+                    header["s1"] = it["cx"]
+            elif it["cx"] < cat_x and ("+" in t or t.replace(" ", "") == "2+3"):
+                header["s2"] = it["cx"]
+            elif it["cx"] > cat_x and ("treffer" in t or "hits" in t):
+                header["tr"] = it["cx"]
+            elif it["cx"] > cat_x and ("ringe" in t or "score" in t):
+                header["rg"] = it["cx"]
+
+        if header["s1"] is not None and header["s2"] is not None:
+            col_w = header["s2"] - header["s1"]
+        elif header["tr"] is not None:
+            col_w = header["tr"] - cat_x
+        else:
+            col_w = w * 0.145
     centers = [
         header["s1"] if header["s1"] is not None else cat_x - 2 * col_w,
         header["s2"] if header["s2"] is not None else cat_x - col_w,
@@ -319,7 +484,8 @@ def detect_table_structure(image: Image.Image) -> Optional[dict]:
         return None
 
     return {
-        "row_cy": {idx: anchors.get(idx, a + b * idx) for idx in range(len(KATEGORIEN))},
+        "categories": categories,
+        "row_cy": row_cy,
         "centers": centers,
         "half_w": col_w / 2 * 0.9,
         "row_h": b,
@@ -355,17 +521,31 @@ def _estimate_tilt(image: Image.Image, max_deg: float = 8.0, step: float = 0.25)
 
 PROMPT_SPALTE = """Du siehst die Ergebnis-Tabelle einer Schiess-Scorecard.
 5 Spalten: "station 1" | "station 2 + 3" | Kategorie(grau) | "Treffer" | "Ringe".
-Die Zeilen-Kategorien (grau): X, 10, 9, 8, 7, 6, 5, 0, miss.
+Die Zeilen-Kategorien (grau): {cat_str}.
 
 AUFGABE: Lies NUR die handschriftlichen Zahlen in der Spalte "{col_name}".
 Ordne jeden Wert der Kategorie seiner Zeile zu.
 
-Antworte NUR als JSON-Objekt mit allen 9 Kategorien als Schluessel:
-{{"X":"ZAHL","10":null,"9":null,"8":null,"7":null,"6":null,"5":null,"0":null,"miss":null}}
+Antworte NUR als JSON-Objekt mit allen {n_rows} Kategorien als Schluessel:
+{tmpl_json}
 
 "ZAHL" ist ein PLATZHALTER - ersetze ihn durch die Zahl die du wirklich im Bild siehst.
 null = leere oder durchgestrichene/unkenntliche Zelle.
 Die gedruckten Kategorie-Labels (X,10,9,...) sind KEINE Werte - nicht als Wert ausgeben!
+"""
+
+PROMPT_SPALTE_ISOLIERT = """Du siehst die Ergebnis-Tabelle einer Schiess-Scorecard.
+Links steht die Wert-Spalte mit handschriftlichen Zahlen, direkt rechts daneben die graue Kategorie-Spalte ({cat_str}).
+
+AUFGABE: Lies NUR die handschriftlichen Zahlen in der ersten Spalte links.
+Ordne jeden Wert der Kategorie seiner Zeile zu.
+
+Antworte NUR als JSON-Objekt mit allen {n_rows} Kategorien als Schluessel:
+{tmpl_json}
+
+"ZAHL" ist ein PLATZHALTER - ersetze ihn durch die Zahl die du wirklich im Bild siehst.
+null = leere oder durchgestrichene/unkenntliche Zelle.
+Die gedruckten Kategorie-Labels ({cat_str}) sind KEINE Werte - nicht als Wert ausgeben!
 """
 
 PROMPT_TOTALZEILE = """Du siehst die Ergebnis-Tabelle einer Schiess-Scorecard.
@@ -443,6 +623,9 @@ async def read_table_cells(image: Image.Image, struct: dict) -> dict:
     centers, half_w, row_h = struct["centers"], struct["half_w"], struct["row_h"]
     w_img, h_img = struct["w"], struct["h"]
     row_cy = struct["row_cy"]
+    categories = struct.get("categories") or KATEGORIEN
+    cats_data = categories[:-1]
+    n_rows = len(cats_data)
     gray = np.array(image.convert("L"))
     INK_THRESHOLD = 3.0  # % dunkle Pixel
 
@@ -459,13 +642,13 @@ async def read_table_cells(image: Image.Image, struct: dict) -> dict:
     # die ueber >= 2 aufeinanderfolgende Zeilen laufen.
     slash_cells = set()
     for col_idx in (0, 1, 3, 4):
-        col_slashes = [_is_slash_cell(gray, _cell_box(r, col_idx)) for r in range(9)]
-        for r in range(9):
+        col_slashes = [_is_slash_cell(gray, _cell_box(r, col_idx)) for r in range(n_rows)]
+        for r in range(n_rows):
             sl, corr = col_slashes[r]
             if not sl:
                 continue
             prev_ok = r > 0 and col_slashes[r - 1][0] and (col_slashes[r - 1][1] * corr > 0)
-            next_ok = r < 8 and col_slashes[r + 1][0] and (col_slashes[r + 1][1] * corr > 0)
+            next_ok = r < n_rows - 1 and col_slashes[r + 1][0] and (col_slashes[r + 1][1] * corr > 0)
             if prev_ok or next_ok:
                 slash_cells.add((r, col_idx))
 
@@ -474,74 +657,155 @@ async def read_table_cells(image: Image.Image, struct: dict) -> dict:
             return 0.0
         return _ink_ratio(gray, _cell_box(row_idx, col_idx), center=center)
 
-    def cell_has_ink(row_idx, col_idx):
-        # Zellmitte: Bleed aus Nachbarzellen faellt dort raus
-        return cell_ink(row_idx, col_idx, center=True) >= 2.0
-
     # Enger Tabellen-Crop ohne Seitenspalte. Fuer Spalten-Calls endet der
     # Crop unterhalb der miss-Zeile - die total-Zeile wuerde sonst in die
-    # letzten Eintraege "hineinbluten". Der total-Call nutzt das volle Grid.
+    # letzten Eintraege "hineinbluten". Der total-Call nutzt die total-Zeile.
     top = max(0, int(row_cy[0] - row_h * 1.5))
-    bot_data = min(h_img, int(row_cy[8] + row_h * 1.2))   # bis miss
-    bot_full = min(h_img, int(row_cy[9] + row_h * 1.2))   # inkl. total
+    bot_data = min(h_img, int(row_cy[n_rows - 1] + row_h * 1.2))   # bis miss
+    bot_full = min(h_img, int(row_cy[n_rows] + row_h * 1.2))       # inkl. total
     gx0 = max(0, int(centers[0] - half_w))
     gx1 = min(w_img, int(centers[4] + half_w))
     if gx1 - gx0 < 50 or bot_full - top < 50:
         logger.warning("Ungueltige Grid-Geometrie - Fallback auf LLM-Gesamtbild")
         return {"zeilen": []}
 
-    def _grid_b64(bot):
-        grid = image.crop((gx0, top, gx1, bot))
-        gw, gh = grid.size
+    active_by_col = {
+        c: [r for r in range(n_rows) if cell_ink(r, c, center=True) >= INK_THRESHOLD]
+        for c in (0, 1, 3, 4)
+    }
+
+    def _encode_resized(crop_img: Image.Image) -> str:
+        gw, gh = crop_img.size
         if gw < 1200:
-            grid = grid.resize((int(gw * 1.6), int(gh * 1.6)), Image.Resampling.LANCZOS)
-        return encode_image(grid)
+            crop_img = crop_img.resize(
+                (int(gw * 1.6), int(gh * 1.6)), Image.Resampling.LANCZOS
+            )
+        return encode_image(crop_img)
 
-    data_b64 = _grid_b64(bot_data)
-    full_b64 = _grid_b64(bot_full) if bot_full != bot_data else data_b64
+    def _col_b64(col_idx: int) -> str:
+        # Isoliert die abgefragte linke/rechte Wert-Spalte direkt neben der
+        # grauen Kategorie-Spalte, damit das VLM bei beidseitig ausgefuellten
+        # Tabellen (z.B. NPA linke/rechte Scheibe) nicht die Nachbarspalte liest.
+        if col_idx == 1:
+            grid = image.crop((max(0, int(centers[1] - half_w)), top, gx1, bot_data))
+        elif col_idx == 0 and active_by_col[1]:
+            left_p = image.crop((gx0, top, min(w_img, int(centers[0] + half_w)), bot_data))
+            right_p = image.crop((max(0, int(centers[2] - half_w * 0.80)), top, gx1, bot_data))
+            grid = Image.new("RGB", (left_p.width + right_p.width, left_p.height), (255, 255, 255))
+            grid.paste(left_p, (0, 0))
+            grid.paste(right_p, (left_p.width, 0))
+        else:
+            grid = image.crop((gx0, top, gx1, bot_data))
+        return _encode_resized(grid)
 
-    async def col_list(name):
-        # Rueckgabe: Dict Kategorie -> Wert (oder {})
-        return await query_ollama(
-            data_b64, PROMPT_SPALTE.format(col_name=name), num_predict=512)
+    full_b64 = _encode_resized(image.crop((gx0, top, gx1, bot_full)))
+
+    cat_str = ", ".join(cats_data)
+    tmpl_parts = [f'"{cats_data[0]}":"ZAHL"'] + [f'"{c}":null' for c in cats_data[1:]]
+    tmpl_json = "{" + ",".join(tmpl_parts) + "}"
+
+    async def col_list(col_idx: int, name: str):
+        isolated = col_idx in (0, 1) and (col_idx == 1 or bool(active_by_col[1]))
+        if isolated:
+            prompt = PROMPT_SPALTE_ISOLIERT.format(
+                cat_str=cat_str,
+                n_rows=n_rows,
+                tmpl_json=tmpl_json,
+            )
+        else:
+            prompt = PROMPT_SPALTE.format(
+                cat_str=cat_str,
+                col_name=name,
+                n_rows=n_rows,
+                tmpl_json=tmpl_json,
+            )
+        return await query_ollama(_col_b64(col_idx), prompt, num_predict=512)
 
     # Spalten-Gate: nur Spalten fragen, in denen mindestens eine Zelle Tinte hat
     col_defs = [(0, "station 1"), (1, "station 2 + 3"),
                 (3, "Treffer hits"), (4, "Ringe score")]
     jobs = {}
     for col_idx, name in col_defs:
-        if any(cell_has_ink(i, col_idx) for i in range(9)):
-            jobs[col_idx] = col_list(name)
+        if active_by_col[col_idx]:
+            jobs[col_idx] = col_list(col_idx, name)
     jobs["total"] = query_ollama(full_b64, PROMPT_TOTALZEILE, num_predict=256)
 
     results = await asyncio.gather(*jobs.values())
     lists = dict(zip(jobs.keys(), results))
 
     def _valid(v):
-        return isinstance(v, str) and bool(re.fullmatch(r"[\d()xX\-]+", v))
+        return (isinstance(v, str)
+                and v.upper() != "ZAHL"
+                and bool(re.fullmatch(r"[\d()xX\-]+", v)))
 
     col_keys = {0: "station_1_links", 1: "station_2_rechts", 3: "treffer", 4: "ringe"}
-    zeilen = []
-    for idx, cat in enumerate(KATEGORIEN[:9]):
-        row = {"kategorie": cat}
-        for col_idx, key in col_keys.items():
-            val = None
-            d = lists.get(col_idx) or {}
-            if cat in d:
-                v = _coerce_str(d.get(cat))
-                ink = cell_ink(idx, col_idx, center=True)
-                if v and _valid(v) and ink >= INK_THRESHOLD:
-                    val = v
-            row[key] = val
-        zeilen.append(row)
+    zeilen = [{"kategorie": cat} for cat in cats_data]
+    for col_idx, key in col_keys.items():
+        active = active_by_col[col_idx]
+        d = lists.get(col_idx) or {}
+        col_vals = {idx: None for idx in range(n_rows)}
+        if active and d:
+            # Wenn die oberste Zeile ("X") leer ist (0 not in active), das VLM
+            # die gelesenen Werte aber ab dem ersten JSON-Schluessel ("X")
+            # eingetragen hat, verschieben wir sie auf die aktiven Zeilen.
+            v_first = _coerce_str(d.get(cats_data[0]))
+            if 0 not in active and v_first and _valid(v_first):
+                for k_idx, r_idx in enumerate(active):
+                    if k_idx < n_rows:
+                        v = _coerce_str(d.get(cats_data[k_idx]))
+                        if v and _valid(v):
+                            col_vals[r_idx] = v
+            else:
+                for r_idx in active:
+                    cat = cats_data[r_idx]
+                    v = _coerce_str(d.get(cat))
+                    if v and _valid(v):
+                        col_vals[r_idx] = v
+        for idx in range(n_rows):
+            zeilen[idx][key] = col_vals[idx]
+
+    def _clean_total(val):
+        s = _coerce_str(val)
+        if not s or s.upper() == "ZAHL" or not re.search(r"\d", s):
+            return None
+        return s
 
     td = lists.get("total") or {}
     totals = {
-        "station_1_total": _coerce_str(td.get("station_1_total")),
-        "station_2_total": _coerce_str(td.get("station_2_total")),
-        "treffer_gesamt": _coerce_str(td.get("treffer_gesamt")),
-        "ringe_gesamt": _coerce_str(td.get("ringe_gesamt")),
+        "station_1_total": _clean_total(td.get("station_1_total")),
+        "station_2_total": _clean_total(td.get("station_2_total")),
+        "treffer_gesamt": _clean_total(td.get("treffer_gesamt")),
+        "ringe_gesamt": _clean_total(td.get("ringe_gesamt")),
     }
+
+    # EasyOCR-Tokens in der Total-Zeile als Ergaenzung/Validierung nutzen
+    total_cy = row_cy[n_rows]
+    ocr_totals = {0: None, 1: None, 3: None, 4: None}
+    for it in struct.get("items") or []:
+        if abs(it["cy"] - total_cy) <= row_h * 0.65 and re.fullmatch(r"[\d()]+", it["text"].strip()):
+            for c_idx in (0, 1, 3, 4):
+                if abs(it["cx"] - centers[c_idx]) <= half_w * 1.1:
+                    ocr_totals[c_idx] = it["text"].strip()
+    for c_idx, t_key in ((0, "station_1_total"), (1, "station_2_total"),
+                         (3, "treffer_gesamt"), (4, "ringe_gesamt")):
+        if not totals[t_key] and ocr_totals[c_idx]:
+            totals[t_key] = ocr_totals[c_idx]
+
+    def _num(v):
+        mm = re.match(r"\d+", v or "")
+        return int(mm.group(0)) if mm else None
+
+    # Wenn beide Stationsspalten aktiv sind (z.B. NPA linke & rechte Scheibe),
+    # muessen station_1_total, station_2_total, treffer_gesamt und ringe_gesamt
+    # zu den gelesenen Spaltensummen passen (verhindert PP1-Beispielwerte aus dem Prompt).
+    s1_nums = [_num(r.get("station_1_links")) for r in zeilen if _num(r.get("station_1_links")) is not None]
+    s2_nums = [_num(r.get("station_2_rechts")) for r in zeilen if _num(r.get("station_2_rechts")) is not None]
+    if s1_nums and s2_nums:
+        s1_sum = sum(s1_nums)
+        s2_sum = sum(s2_nums)
+        totals["station_1_total"] = str(s1_sum)
+        totals["station_2_total"] = str(s2_sum)
+        totals["treffer_gesamt"] = str(s1_sum + s2_sum)
 
     # Checksum: die Stationswerte (Anzahl Schuesse je Kategorie) muessen sich
     # zum gedruckten treffer_gesamt addieren. Ist die Summe zu gross, ist ein
@@ -551,11 +815,6 @@ async def read_table_cells(image: Image.Image, struct: dict) -> dict:
     m = re.match(r"\d+", totals.get("treffer_gesamt") or "")
     if m:
         target = int(m.group(0))
-
-        def _num(v):
-            mm = re.match(r"\d+", v or "")
-            return int(mm.group(0)) if mm else None
-
         filled = [(i, k) for i, r in enumerate(zeilen)
                   for k in ("station_1_links", "station_2_rechts")
                   if _num(r.get(k)) is not None]
@@ -599,6 +858,24 @@ async def read_table_cells(image: Image.Image, struct: dict) -> dict:
         elif total < target:
             logger.warning("Checksum: Summe %d < treffer_gesamt %d - "
                            "vermutlich fehlende Werte", total, target)
+
+    # Ringe-Gesamtsumme aus den Zeilenwerten berechnen/validieren
+    max_ring = int(cats_data[1]) if len(cats_data) > 1 and cats_data[1].isdigit() else 10
+    ringe_sum = 0
+    for r in zeilen:
+        cat = r["kategorie"]
+        ring_val = max_ring if cat.upper() == "X" else (int(cat) if cat.isdigit() else 0)
+        c1 = _num(r.get("station_1_links")) or 0
+        c2 = _num(r.get("station_2_rechts")) or 0
+        ct = _num(r.get("treffer")) or 0
+        shots = (c1 + c2) if (c1 or c2) else ct
+        ringe_sum += ring_val * shots
+    if ringe_sum > 0 and (
+        not totals.get("ringe_gesamt")
+        or (s1_nums and s2_nums)
+        or (_num(totals.get("ringe_gesamt")) == 300 and ringe_sum != 300)
+    ):
+        totals["ringe_gesamt"] = str(ringe_sum)
 
     return {
         "zeilen": zeilen,
