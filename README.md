@@ -12,7 +12,7 @@ FastAPI-Service zur automatischen Auswertung von Schützenvereins-Scorecards (PP
 
    ```bash
    # Empfohlen (beste Erkennung fuer handschriftliche Scorecards)
-   ollama pull llama3.2-vision
+   ollama pull qwen2.5vl:3b
 
    # Alternative: schneller, aber weniger genau
    ollama pull llava
@@ -54,7 +54,7 @@ FastAPI-Service zur automatischen Auswertung von Schützenvereins-Scorecards (PP
 
 ## Anderes Modell nutzen
 
-Der Standard in `main.py` ist `llama3.2-vision`. Falls du ein anderes Modell verwenden möchtest, setze vor dem Server-Start die Umgebungsvariable:
+Der Standard in `main.py` ist `qwen2.5vl:3b`. Falls du ein anderes Modell verwenden möchtest, setze vor dem Server-Start die Umgebungsvariable:
 
 **Windows PowerShell:**
 
@@ -114,7 +114,7 @@ Beispiel-Response:
     "ringe_gesamt": "300"
   },
   "auswerter": null,
-  "modell": "llama3.2-vision"
+  "modell": "qwen2.5vl:3b"
 }
 ```
 
@@ -123,4 +123,4 @@ Beispiel-Response:
 | Variable       | Standard                 | Beschreibung                     |
 | -------------- | ------------------------ | -------------------------------- |
 | `OLLAMA_HOST`  | `http://localhost:11434` | URL der Ollama-Instanz.          |
-| `OLLAMA_MODEL` | `llama3.2-vision`        | Name des lokalen Vision-Modells. |
+| `OLLAMA_MODEL` | `qwen2.5vl:3b`           | Name des lokalen Vision-Modells. |

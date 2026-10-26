@@ -5,7 +5,9 @@ mit einem lokalen Vision-Modell via Ollama.
 
 import base64
 import json
+import logging
 import os
+import re
 from io import BytesIO
 from typing import List, Optional
 
@@ -26,7 +28,8 @@ except ImportError:
 # Konfiguration
 # ---------------------------------------------------------------------------
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.2-vision")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5vl:3b")
+USE_EASYOCR = os.environ.get("USE_EASYOCR", "1") == "1" and EASYOCR_AVAILABLE
 MAX_IMAGE_SIZE = (1536, 1536)  # Größer für bessere handschriftliche Erkennung
 
 app = FastAPI(
@@ -48,11 +51,16 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 class ErgebnisZeile(BaseModel):
     """Eine einzelne Zeile in der Ergebnis-Tabelle."""
-    kategorie: str = Field(..., description="Ring-Kategorie, z.B. 'X', '10', '9', 'miss'")
+    kategorie: str = Field("?", description="Ring-Kategorie, z.B. 'X', '10', '9', 'miss'")
     station_1_links: Optional[str] = Field(None, description="Handschriftlicher Wert linke/spalte (PP1=station1, NPA=linke Scheibe)")
     station_2_rechts: Optional[str] = Field(None, description="Handschriftlicher Wert rechte Spalte (PP1=station2+3, NPA=rechte Scheibe)")
     treffer: Optional[str] = Field(None, description="Wert in Treffer/Spalte falls eingetragen")
     ringe: Optional[str] = Field(None, description="Wert in Ringe/Spalte falls eingetragen")
+
+    @field_validator("*", mode="before")
+    @classmethod
+    def _fix_fields(cls, v):
+        return _coerce_str(v)
 
 
 class Ergebnisse(BaseModel):
@@ -63,13 +71,22 @@ class Ergebnisse(BaseModel):
     treffer_gesamt: Optional[str] = Field(None, description="Gesamt-Treffer")
     ringe_gesamt: Optional[str] = Field(None, description="Gesamt-Ringe/Score")
 
+    @field_validator("station_1_total", "station_2_total", "treffer_gesamt", "ringe_gesamt", mode="before")
+    @classmethod
+    def _fix_fields(cls, v):
+        return _coerce_str(v)
+
 
 def _coerce_str(v):
-    """Hilfsfunktion: Wandelt Listen/Dicts in None um, ansonsten String."""
+    """Hilfsfunktion: Zahlen -> String, Listen/Dicts -> None, Leerstring -> None."""
     if v is None:
         return None
     if isinstance(v, str):
-        return v
+        return v.strip() or None
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return str(v)
     return None
 
 
@@ -91,7 +108,7 @@ class ScorecardAuswertung(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Prompt fuer llama3.2-vision
+# Prompt fuer qwen2.5vl:3b
 # ---------------------------------------------------------------------------
 PROMPT_KOPF = """Du siehst den oberen Teil einer Schuetzenvereins-Scorecard.
 Lies die Textfelder und gib NUR JSON zurueck.
@@ -103,36 +120,34 @@ Felder:
 - stand_details: z.B. "P2 25m Stand xy"
 - datum_zeit: z.B. "21.09.2026 18:00 - 21:00"
 
-Regeln: NUR JSON. Leer = null.
+Regeln: NUR JSON. Leer = null. Verwende AUSSCHLIESSLICH Werte aus dem Bild.
 Schema: {"schuetze":null,"disziplin":null,"disziplin_checkbox":null,"stand_details":null,"datum_zeit":null}
 """
 
-PROMPT_TABELLE = """Du siehst eine vergroesserte Tabelle aus einer Schuetzenvereins-Scorecard.
+PROMPT_TABELLE = """Du siehst die Ergebnis-Tabelle einer Schuetzenvereins-Scorecard.
 Lies die handschriftlichen Zahlen und gib NUR JSON zurueck.
 
-DIE TABELLE:
-- Links stehen die Kategorien: X, 10, 9, 8, 7, 6, 5, 0, miss (von oben nach unten)
-- Daneben sind Spalten mit handschriftlichen Zahlen
-- Du musst fuer JEDE Kategorie die Zahl in der ERSTEN Spalte (links) lesen
+AUFBAU - 5 Spalten von links nach rechts:
+1. "station 1": handschriftliche Zahl
+2. "station 2 + 3": handschriftliche Zahl
+3. Kategorie (gedruckt, grauer Kasten): X, 10, 9, 8, 7, 6, 5, 0, miss
+4. "Treffer hits": Zahl
+5. "Ringe score": Zahl
 
-WICHTIG: Gib die Zeilen IN DER RICHTIGEN REIHENFOLGE zurueck.
-Reihenfolge von oben nach unten: X, 10, 9, 8, 7, 6, 5, 0, miss
+AUFGABE:
+- Lies fuer JEDE Kategorie-Zeile die handschriftlichen Werte in Spalte 1 und 2.
+- Reihenfolge von oben nach unten: X, 10, 9, 8, 7, 6, 5, 0, miss.
+- Letzte Zeile "total": station_1_total = Spalte 1, station_2_total = Spalte 2,
+  treffer_gesamt = Spalte 4, ringe_gesamt = Spalte 5.
 
-ZUSÄTZLICH unten in der Tabelle:
-- total_zeile_station_1: Die Zahl in der "total" Zeile, erste Spalte (z.B. "30")
-- station_1_total: z.B. "12(10)"
-- station_2_total: z.B. "18(20)"
-- treffer_gesamt: z.B. "30"
-- ringe_gesamt: z.B. "300"
+WICHTIG: Die null-Werte im Schema sind PLATZHALTER.
+Ersetze sie durch die tatsaechlich gelesenen Zahlen aus dem Bild.
+Leere Zelle im Bild = null. Schreibe Zahlen EXAKT wie im Bild (z.B. "12(10)").
 
-Regeln:
-- NUR JSON, keine Erklaerungen.
-- DOPPELTE Anfuehrungszeichen.
-- Leer oder nicht erkennbar = null.
-- Schreibe die Zahlen EXAKT so wie sie im Bild stehen.
+Regeln: NUR JSON, keine Erklaerungen. DOPPELTE Anfuehrungszeichen.
 
 Schema:
-{"zeilen":[{"kategorie":"X","station_1_links":null,"station_2_rechts":null},{"kategorie":"10","station_1_links":null,"station_2_rechts":null},{"kategorie":"9","station_1_links":null,"station_2_rechts":null},{"kategorie":"8","station_1_links":null,"station_2_rechts":null},{"kategorie":"7","station_1_links":null,"station_2_rechts":null},{"kategorie":"6","station_1_links":null,"station_2_rechts":null},{"kategorie":"5","station_1_links":null,"station_2_rechts":null},{"kategorie":"0","station_1_links":null,"station_2_rechts":null},{"kategorie":"miss","station_1_links":null,"station_2_rechts":null}],"total_zeile_station_1":null,"station_1_total":null,"station_2_total":null,"treffer_gesamt":null,"ringe_gesamt":null}
+{"zeilen":[{"kategorie":"X","station_1_links":null,"station_2_rechts":null},{"kategorie":"10","station_1_links":null,"station_2_rechts":null},{"kategorie":"9","station_1_links":null,"station_2_rechts":null},{"kategorie":"8","station_1_links":null,"station_2_rechts":null},{"kategorie":"7","station_1_links":null,"station_2_rechts":null},{"kategorie":"6","station_1_links":null,"station_2_rechts":null},{"kategorie":"5","station_1_links":null,"station_2_rechts":null},{"kategorie":"0","station_1_links":null,"station_2_rechts":null},{"kategorie":"miss","station_1_links":null,"station_2_rechts":null}],"station_1_total":null,"station_2_total":null,"treffer_gesamt":null,"ringe_gesamt":null}
 """
 
 # ---------------------------------------------------------------------------
@@ -157,92 +172,253 @@ def preprocess_image(image: Image.Image) -> Image.Image:
 
 
 def split_for_regions(image: Image.Image) -> tuple[Image.Image, Image.Image]:
-    """Teilt das Bild in Kopf (Text) und Tabelle (Zahlen)."""
+    """Teilt das Bild in Kopf (Text) und Tabelle (Zahlen) ohne Verzerrung."""
     w, h = image.size
-    # Kopf: obere 45%
-    kopf = image.crop((0, 0, w, int(h * 0.45)))
-    # Tabelle: untere 55%, skaliert auf volle Hoehe fuer bessere Erkennung
-    tabelle = image.crop((0, int(h * 0.35), w, h))
-    # Tabelle auf volle Groesse skalieren
-    tabelle = tabelle.resize((w, h), Image.Resampling.LANCZOS)
+    # Kopf: obere 48% (Textbox + Checkboxen komplett)
+    kopf = image.crop((0, 0, w, int(h * 0.48)))
+    # Tabelle: untere 62%, Seitenverhaeltnis beibehalten
+    tabelle = image.crop((0, int(h * 0.38), w, h))
     return kopf, tabelle
 
 
-def extract_table_with_easyocr(image: Image.Image) -> dict:
-    """Liest die Tabelle mit EasyOCR aus (Zeilen-basiert)."""
+KATEGORIEN = ["X", "10", "9", "8", "7", "6", "5", "0", "miss", "total"]
+
+
+def detect_table_structure(image: Image.Image) -> Optional[dict]:
+    """
+    EasyOCR-Strukturpass: liefert Zeilen-Y-Positionen und Spalten-X-Zentren
+    der Tabelle, verankert an den gedruckten Kategorie-Labels (X..total).
+    Die handschriftlichen Werte werden NICHT hier gelesen - das macht das LLM
+    pro Zelle (siehe read_table_cells).
+    """
     if not EASYOCR_AVAILABLE:
-        return {}
+        return None
 
     import numpy as np
 
     # Lazy-Initialisierung
-    if not hasattr(extract_table_with_easyocr, "_reader"):
-        extract_table_with_easyocr._reader = easyocr.Reader(["en", "de"], gpu=False)
+    if not hasattr(detect_table_structure, "_reader"):
+        detect_table_structure._reader = easyocr.Reader(["en", "de"], gpu=False)
+    reader = detect_table_structure._reader
 
-    reader = extract_table_with_easyocr._reader
     w, h = image.size
+    cat_lower = [c.lower() for c in KATEGORIEN]
 
-    # Tabelle in 9 Zeilen aufteilen (X, 10, 9, 8, 7, 6, 5, 0, miss)
-    kategorien = ["X", "10", "9", "8", "7", "6", "5", "0", "miss"]
-    zeilen_hoehe = h // 9
-    zeilen = []
-
-    for i, kat in enumerate(kategorien):
-        y1 = i * zeilen_hoehe
-        y2 = (i + 1) * zeilen_hoehe if i < 8 else h
-        row_img = image.crop((0, y1, w, y2))
-
-        # OCR auf der Zeile ausfuehren
-        results = reader.readtext(np.array(row_img))
-
-        # Nur Zahlen extrahieren (hoechste Konfidenz zuerst)
-        zahlen = []
-        for (_, text, conf) in results:
-            text = text.strip()
-            if text.isdigit():
-                zahlen.append((text, conf))
-
-        # Sortieren nach Konfidenz und ersten 2 nehmen
-        zahlen.sort(key=lambda x: x[1], reverse=True)
-        station_1 = zahlen[0][0] if zahlen else None
-
-        zeilen.append({
-            "kategorie": kat,
-            "station_1_links": station_1,
-            "station_2_rechts": None,
-        })
-
-    # Summenzeile (letzter Streifen)
-    summen_img = image.crop((0, h - zeilen_hoehe, w, h))
-    summen_results = reader.readtext(np.array(summen_img))
-    summen_zahlen = [text for (_, text, _) in summen_results if text.strip().isdigit() or "(" in text]
-
-    # Heuristik fuer Summen
-    station_1_total = None
-    station_2_total = None
-    treffer_gesamt = None
-    ringe_gesamt = None
-
-    for (_, text, _) in summen_results:
+    items = []
+    for bbox, text, conf in reader.readtext(np.array(image)):
         text = text.strip()
-        if "(" in text and ")" in text:
-            if station_1_total is None:
-                station_1_total = text
-            elif station_2_total is None:
-                station_2_total = text
+        if not text:
+            continue
+        xs = [p[0] for p in bbox]
+        ys = [p[1] for p in bbox]
+        items.append({
+            "text": text, "conf": conf,
+            "cx": sum(xs) / len(xs), "cy": sum(ys) / len(ys),
+            "x0": min(xs), "x1": max(xs), "y0": min(ys), "y1": max(ys),
+        })
+    if not items:
+        return None
 
-    # Reine Zahlen fuer Treffer und Ringe
-    pure_numbers = [text for (_, text, _) in summen_results if text.strip().isdigit()]
-    if len(pure_numbers) >= 2:
-        treffer_gesamt = pure_numbers[-2]
-        ringe_gesamt = pure_numbers[-1]
+    cat_tokens = [it for it in items if it["text"].lower() in cat_lower]
+    if len(cat_tokens) < 2:
+        logger.warning("EasyOCR: weniger als 2 Kategorie-Labels erkannt")
+        return None
+
+    cat_x = sorted(t["cx"] for t in cat_tokens)[len(cat_tokens) // 2]
+    anchors = {}
+    for it in cat_tokens:
+        if abs(it["cx"] - cat_x) <= 0.15 * w:
+            idx = cat_lower.index(it["text"].lower())
+            anchors.setdefault(idx, []).append(it["cy"])
+    anchors = {idx: sum(v) / len(v) for idx, v in anchors.items()}
+    if len(anchors) < 2:
+        logger.warning("EasyOCR: zu wenige Zeilen-Anker")
+        return None
+
+    # Zeilen sind gleichmaessig verteilt -> linearer Fit: cy = a + b*idx
+    idxs = np.array(list(anchors.keys()))
+    cys = np.array(list(anchors.values()))
+    b, a = np.polyfit(idxs, cys, 1)
+
+    # --- Spaltenzentren aus Header-Labels ---
+    header = {"s1": None, "s2": None, "tr": None, "rg": None}
+    for it in items:
+        t = it["text"].lower()
+        if "station" in t or "slation" in t:
+            if "2" in t or "+" in t:
+                header["s2"] = it["cx"]
+            elif "1" in t or header["s1"] is None:
+                header["s1"] = it["cx"]
+        elif "+" in t or t.replace(" ", "") == "2+3":
+            # Header-Token "2 + 3" steht separat unter "station"
+            header["s2"] = it["cx"]
+        elif "treffer" in t or "hits" in t:
+            header["tr"] = it["cx"]
+        elif "ringe" in t or "score" in t:
+            header["rg"] = it["cx"]
+
+    if header["s1"] is not None and header["s2"] is not None:
+        col_w = header["s2"] - header["s1"]
+    elif header["tr"] is not None:
+        col_w = header["tr"] - cat_x
+    else:
+        col_w = w * 0.145
+    centers = [
+        header["s1"] if header["s1"] is not None else cat_x - 2 * col_w,
+        header["s2"] if header["s2"] is not None else cat_x - col_w,
+        cat_x,
+        header["tr"] if header["tr"] is not None else cat_x + col_w,
+        header["rg"] if header["rg"] is not None else cat_x + 2 * col_w,
+    ]
+
+    # Geometrie-Validierung: Spalten muessen streng aufsteigend und sinnvoll
+    # dimensioniert sein, sonst -> Fallback auf LLM-Gesamtbild
+    if (col_w < 15 or col_w > w * 0.6 or b < 10 or b > h * 0.4
+            or not (centers[0] < centers[1] < centers[2] < centers[3] < centers[4])):
+        logger.warning("EasyOCR: degenerierte Tabellen-Geometrie (centers=%s, col_w=%.0f, row_h=%.0f)",
+                       [round(c) for c in centers], col_w, b)
+        return None
 
     return {
+        "row_cy": {idx: anchors.get(idx, a + b * idx) for idx in range(len(KATEGORIEN))},
+        "centers": centers,
+        "half_w": col_w / 2 * 0.9,
+        "row_h": b,
+        "w": w,
+        "h": h,
+        "items": items,
+    }
+
+
+PROMPT_SPALTE = """Du siehst die Ergebnis-Tabelle einer Schiess-Scorecard.
+5 Spalten: "station 1" | "station 2 + 3" | Kategorie(grau) | "Treffer" | "Ringe".
+9 Daten-Zeilen von oben nach unten: X, 10, 9, 8, 7, 6, 5, 0, miss.
+
+AUFGABE: Lies NUR die handschriftlichen Zahlen in der Spalte "{col_name}".
+Von oben nach unten, exakt 9 Eintraege.
+
+Antworte NUR als JSON:
+{{"{key}":["ZAHL",null,"ZAHL",null,null,null,null,null,null]}}
+
+"ZAHL" ist ein PLATZHALTER - ersetze ihn durch die Zahl die du wirklich im Bild siehst.
+null = leere Zelle. Gib NICHT einfach das Beispiel zurueck!
+Wenn eine handschriftliche Zahl zu sehen ist, MUSS sie in der Liste stehen.
+"""
+
+PROMPT_TOTALZEILE = """Du siehst die Ergebnis-Tabelle einer Schiess-Scorecard.
+In der letzten Zeile ("total") stehen 4 Werte von links nach rechts:
+1. station_1_total: Format z.B. "12(10)"
+2. station_2_total: Format z.B. "18(20)"
+3. treffer_gesamt: z.B. "30"
+4. ringe_gesamt: z.B. "300"
+Antworte NUR als JSON:
+{"station_1_total":null,"station_2_total":null,"treffer_gesamt":null,"ringe_gesamt":null}
+"""
+
+
+def _ink_ratio(gray, box) -> float:
+    """Dunkler-Pixel-Anteil im inneren 80% einer Zelle (Gitterlinien ignoriert)."""
+    x0, y0, x1, y1 = box
+    cell = gray[y0:y1, x0:x1]
+    ch, cw = cell.shape
+    if ch < 5 or cw < 5:
+        return 0.0
+    inner = cell[int(ch * .15):int(ch * .85), int(cw * .10):int(cw * .90)]
+    if inner.size == 0:
+        return 0.0
+    return float((inner < 110).mean() * 100)
+
+
+async def read_table_cells(image: Image.Image, struct: dict) -> dict:
+    """
+    Liest die Tabelle mit wenigen LLM-Aufrufen:
+    - 1 Call pro Wert-Spalte (Liste mit 9 Werten von oben nach unten) -
+      eine einzelne Spalte top-to-bottom ist eine Aufgabe, die auch kleine
+      VLMs zuverlaessig loesen.
+    - 1 Call fuer die Total-Zeile.
+    - Ink-Gate pro Zelle: kein Pixel -> kein Wert (killt Halluzinationen
+      in leeren Zellen/Spalten).
+    """
+    import asyncio
+    import numpy as np
+
+    centers, half_w, row_h = struct["centers"], struct["half_w"], struct["row_h"]
+    w_img, h_img = struct["w"], struct["h"]
+    row_cy = struct["row_cy"]
+    gray = np.array(image.convert("L"))
+    INK_THRESHOLD = 3.0  # % dunkle Pixel
+
+    def cell_has_ink(row_idx, col_idx):
+        cy = row_cy[row_idx]
+        box = (
+            max(0, int(centers[col_idx] - half_w)),
+            max(0, int(cy - row_h * 0.55)),
+            min(w_img, int(centers[col_idx] + half_w)),
+            min(h_img, int(cy + row_h * 0.55)),
+        )
+        return _ink_ratio(gray, box) >= INK_THRESHOLD
+
+    # Enger Tabellen-Crop ohne Seitenspalte, vergroessert
+    top = max(0, int(row_cy[0] - row_h * 1.5))
+    bot = min(h_img, int(row_cy[9] + row_h * 1.2))
+    gx0 = max(0, int(centers[0] - half_w))
+    gx1 = min(w_img, int(centers[4] + half_w))
+    if gx1 - gx0 < 50 or bot - top < 50:
+        logger.warning("Ungueltige Grid-Geometrie - Fallback auf LLM-Gesamtbild")
+        return {"zeilen": []}
+    grid = image.crop((gx0, top, gx1, bot))
+    gw, gh = grid.size
+    if gw < 1200:
+        grid = grid.resize((int(gw * 1.6), int(gh * 1.6)), Image.Resampling.LANCZOS)
+    grid_b64 = encode_image(grid)
+
+    async def col_list(key, name):
+        data = await query_ollama(grid_b64, PROMPT_SPALTE.format(col_name=name, key=key), num_predict=512)
+        lst = data.get(key)
+        if not isinstance(lst, list):
+            for v in data.values():
+                if isinstance(v, list):
+                    lst = v
+                    break
+        return lst if isinstance(lst, list) else []
+
+    # Spalten-Gate: nur Spalten fragen, in denen mindestens eine Zelle Tinte hat
+    col_defs = [(0, "station_1", "station 1"), (1, "station_2", "station 2 + 3"),
+                (3, "treffer", "Treffer hits"), (4, "ringe", "Ringe score")]
+    jobs = {}
+    for col_idx, key, name in col_defs:
+        if any(cell_has_ink(i, col_idx) for i in range(9)):
+            jobs[col_idx] = col_list(key, name)
+    jobs["total"] = query_ollama(grid_b64, PROMPT_TOTALZEILE, num_predict=256)
+
+    results = await asyncio.gather(*jobs.values())
+    lists = dict(zip(jobs.keys(), results))
+
+    def _valid(v):
+        return isinstance(v, str) and bool(re.fullmatch(r"[\d()xX\-]+", v))
+
+    col_keys = {0: "station_1_links", 1: "station_2_rechts", 3: "treffer", 4: "ringe"}
+    zeilen = []
+    for idx, cat in enumerate(KATEGORIEN[:9]):
+        row = {"kategorie": cat}
+        for col_idx, key in col_keys.items():
+            val = None
+            lst = lists.get(col_idx) or []
+            if idx < len(lst):
+                v = _coerce_str(lst[idx])
+                # Wert nur akzeptieren wenn Format stimmt UND Zelle Tinte hat
+                if v and _valid(v) and cell_has_ink(idx, col_idx):
+                    val = v
+            row[key] = val
+        zeilen.append(row)
+
+    td = lists.get("total") or {}
+    return {
         "zeilen": zeilen,
-        "station_1_total": station_1_total,
-        "station_2_total": station_2_total,
-        "treffer_gesamt": treffer_gesamt,
-        "ringe_gesamt": ringe_gesamt,
+        "station_1_total": _coerce_str(td.get("station_1_total")),
+        "station_2_total": _coerce_str(td.get("station_2_total")),
+        "treffer_gesamt": _coerce_str(td.get("treffer_gesamt")),
+        "ringe_gesamt": _coerce_str(td.get("ringe_gesamt")),
     }
 
 
@@ -252,8 +428,6 @@ def encode_image(image: Image.Image) -> str:
     image.save(buffer, format="JPEG", quality=90)
     return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
-
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -279,9 +453,6 @@ def extract_json(raw: str) -> str:
     if start != -1 and end != -1 and end > start:
         return raw[start:end + 1]
     return raw
-
-
-import re
 
 
 def repair_json(text: str) -> str:
@@ -325,17 +496,17 @@ def parse_json_safe(raw: str) -> dict:
             return {}
 
 
-async def query_ollama(image_b64: str, prompt: str) -> dict:
+async def query_ollama(image_b64: str, prompt: str, num_predict: int = 2048) -> dict:
     """Fragt Ollama mit einem Bild ab."""
     payload = {
         "model": OLLAMA_MODEL,
         "messages": [
-            {"role": "system", "content": prompt},
-            {"role": "user", "content": "Lies dieses Bild.", "images": [image_b64]},
+            {"role": "user", "content": prompt, "images": [image_b64]},
         ],
         "stream": False,
         "format": "json",
-        "options": {"temperature": 0.1, "num_predict": 2048},
+        "keep_alive": "30m",
+        "options": {"temperature": 0.0, "num_predict": num_predict, "num_ctx": 4096},
     }
     url = f"{OLLAMA_HOST.rstrip('/')}/api/chat"
 
@@ -357,7 +528,18 @@ async def query_ollama(image_b64: str, prompt: str) -> dict:
 
     raw = data.get("message", {}).get("content", "{}")
     logger.info("Raw model response (first 500 chars): %s", raw[:500])
-    return parse_json_safe(raw)
+    result = parse_json_safe(raw)
+    if not result:
+        logger.warning("JSON-Parse fehlgeschlagen, versuche Retry. Raw: %s", raw[:500])
+        async with httpx.AsyncClient(timeout=600.0) as client:
+            try:
+                resp = await client.post(url, json=payload)
+            except Exception as exc:
+                raise HTTPException(status_code=502, detail=f"Ollama-Fehler beim Retry: {exc}")
+        if resp.status_code == 200:
+            raw = resp.json().get("message", {}).get("content", "{}")
+            result = parse_json_safe(raw)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -389,18 +571,23 @@ async def process_scorecard(file: UploadFile = File(...)) -> ScorecardAuswertung
     processed = preprocess_image(image)
     kopf_img, tabelle_img = split_for_regions(processed)
 
-    # --- Kopf mit llama3.2-vision ---
+    # --- Kopf mit qwen2.5vl:3b ---
     kopf_data = await query_ollama(encode_image(kopf_img), PROMPT_KOPF)
 
-    # --- Tabelle mit EasyOCR (falls verfuegbar) oder llama3.2-vision ---
-    if EASYOCR_AVAILABLE:
-        tabelle_data = extract_table_with_easyocr(tabelle_img)
-    else:
+    # --- Tabelle: EasyOCR liefert Geometrie, LLM liest nur Zellen mit Tinte ---
+    tabelle_data = {}
+    if USE_EASYOCR:
+        struct = detect_table_structure(tabelle_img)
+        if struct:
+            tabelle_data = await read_table_cells(tabelle_img, struct)
+    if not tabelle_data or not tabelle_data.get("zeilen"):
+        if USE_EASYOCR:
+            logger.info("Keine Tabellen-Struktur gefunden - Fallback auf LLM-Gesamtbild")
         tabelle_data = await query_ollama(encode_image(tabelle_img), PROMPT_TABELLE)
 
     # --- Ergebnisse parsen und zusammenfuehren ---
     zeilen_raw = tabelle_data.get("zeilen") or []
-    zeilen = [ErgebnisZeile(**z) for z in zeilen_raw if isinstance(z, dict)]
+    zeilen = [ErgebnisZeile.model_validate(z) for z in zeilen_raw if isinstance(z, dict)]
 
     ergebnisse = Ergebnisse(
         zeilen=zeilen,
